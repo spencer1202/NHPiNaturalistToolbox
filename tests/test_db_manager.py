@@ -66,7 +66,7 @@ def test_update_experts(db, experts_clean):
 
 def test_get_full_observations(db):
     with db as conn:
-        df = conn.get_full_observations()
+        df = conn.select("full_observations")
     
     print(f"\n\n")
     print("-------------------------------------------")

@@ -5,7 +5,6 @@ import sqlite3
 import logging
 from contextlib import closing
 import datetime as dt
-from typing import Optional
 import re
 import pandas as pd
 from inatdatapipeline.client import (
@@ -24,6 +23,8 @@ create_statements = {
         CREATE TABLE IF NOT EXISTS tracking_taxa (
             est_id                int     NOT NULL PRIMARY KEY,
             sci_name              text,
+            search_name           text,
+            is_described          boolean CHECK (is_described IN (NULL, true, false)),
             element_type          text,
             scientific_name       text,
             common_name           text,
@@ -50,6 +51,24 @@ create_statements = {
         );
         """,
 
+    "tracking_rel":
+        """
+        CREATE TABLE IF NOT EXISTS tracking_rel (
+            taxon_id              int     NOT NULL REFERENCES inat_taxa(taxon_id),
+            est_id                int     NOT NULL REFERENCES tracking_taxa(est_id),
+            PRIMARY KEY(taxon_id, est_id)
+        );
+        """,
+
+    "tracking_trigger": 
+        """
+        CREATE TRIGGER IF NOT EXISTS fk_cascade_delete_tracking
+        AFTER DELETE ON inat_taxa
+        BEGIN
+            DELETE FROM tracking_rel WHERE taxon_id = OLD.taxon_id;
+        END;
+        """,
+
     "inat_taxa_alternatives":
         """
         CREATE TABLE IF NOT EXISTS inat_taxa_alternatives (
@@ -57,16 +76,6 @@ create_statements = {
             alternative_taxon_id    int     NOT NULL,
             alternative_inat_name   str
         )
-        """,
-
-    "tracking_rel":
-        """
-        CREATE TABLE IF NOT EXISTS tracking_rel (
-            taxon_id              int     NOT NULL REFERENCES inat_taxa(taxon_id),
-            est_id                int     NOT NULL REFERENCES tracking_taxa(est_id),
-            described           boolean CHECK (described IN (NULL, true, false)),
-            PRIMARY KEY(taxon_id, est_id)
-        );
         """,
 
     "users":
@@ -135,19 +144,21 @@ create_statements = {
             est_id, 
             elcode, 
             sci_name, 
+            search_name,
+            is_described,
             common_name, 
             taxon_id, 
             inat_name, 
-            described,
             date_updated
         ) AS SELECT 
             tt.est_id, 
             tt.elcode, 
             tt.sci_name, 
+            tt.search_name,
+            tt.is_described,
             tt.common_name, 
             it.taxon_id, 
             it.inat_name, 
-            tr.described,
             it.date_updated
         FROM tracking_taxa AS tt
         JOIN tracking_rel AS tr ON tt.est_id = tr.est_id
@@ -169,15 +180,6 @@ create_statements = {
         LEFT JOIN tracking_rel AS tr
         ON tt.est_id = tr.est_id
         WHERE tr.est_id IS NULL;
-        """,
-
-    "tracking_trigger": 
-        """
-        CREATE TRIGGER IF NOT EXISTS fk_cascade_delete_tracking
-        AFTER DELETE ON inat_taxa
-        BEGIN
-            DELETE FROM tracking_rel WHERE taxon_id = OLD.taxon_id;
-        END;
         """,
 
     "expert_identifications":
@@ -309,6 +311,8 @@ create_statements = {
             tt.est_id,
             tt.element_type,
             tt.sci_name,
+            tt.search_name,
+            tt.is_described,
             tt.scientific_name,
             tt.common_name,
             tt.element_name,
@@ -359,8 +363,10 @@ class DBManager:
         """
         Called when exiting a "with" clause. Commits database transaction and closes connection.
         """
-        self.commit()
-        self.close()
+        self._conn.commit()
+        if self._conn:
+            self._conn.close()
+            self._conn = None
 
 
     def __del__(self):
@@ -397,42 +403,29 @@ class DBManager:
             raise sqlite3.Error(f"Error while creating tables: {ex}")
 
 
-    def commit(self):
-        """
-        Commits database transaction
-        """
-        self.check_connection()
-
-        self._conn.commit()
-
-
-    def close(self):
-        """
-        Closes database connection
-        """
-        if self._conn:
-            self._conn.close()
-            self._conn = None
-
-
     def check_connection(self):
         """Verify that the database connection is active. Raise sqlite3.Error if not."""
         if not self._conn:
             raise sqlite3.Error("Must be connected to a database")
 
 
-    def insert_mappings(self, mapping_df: pd.DataFrame) -> Optional[int]:
+    def insert_tracking(self, tracking_df: pd.DataFrame) -> int:
         """
-        Inserts new taxon mappings into the database. Returns number of rows inserted, or None 
+        Inserts the tracking list into the database. Returns the number of rows inserted, or -1 
         if the dataframe is empty.
-        """
-        if mapping_df is None or len(mapping_df) == 0:
-            return None
 
-        statements = [
-            """
-            INSERT OR IGNORE INTO tracking_taxa (
+        Args: 
+            tracking_df: A dataframe with the tracking list. Should conform to the 
+            TrackingSchemaClean model, including the search_name and is_described columns.
+        """
+        if tracking_df is None or len(tracking_df) == 0:
+            return -1
+
+        statement =  """
+            INSERT INTO tracking_taxa (
                 sci_name,
+                search_name,
+                is_described,
                 est_id, 
                 element_type,
                 scientific_name, 
@@ -449,10 +442,12 @@ class DBManager:
                 growth_habit,
                 duration
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(est_id) 
             DO UPDATE SET
                 sci_name = excluded.sci_name, 
+                search_name = excluded.search_name,
+                is_described = excluded.is_described,
                 element_type = excluded.element_type,
                 scientific_name = excluded.scientific_name,
                 common_name = excluded.common_name,
@@ -467,22 +462,13 @@ class DBManager:
                 elcode = excluded.elcode,
                 growth_habit = excluded.growth_habit,
                 duration = excluded.duration
-            """,
             """
-            INSERT OR IGNORE INTO inat_taxa (taxon_id, inat_name)
-            VALUES (?, ?)
-            ON CONFLICT(taxon_id) 
-            DO UPDATE SET 
-                inat_name = excluded.inat_name;
-            """,
-            """
-            INSERT OR IGNORE INTO tracking_rel (taxon_id, est_id, described)
-            VALUES (?, ?, ?);
-            """
-        ]
+
         tracking_cols = [
             "sci_name", 
-            "est_id", 
+            "search_name",
+            "is_described",
+            "est_id",
             "element_type", 
             "scientific_name", 
             "common_name", 
@@ -498,22 +484,51 @@ class DBManager:
             "growth_habit",
             "duration"
         ]
+
         with closing(self._conn.cursor()) as cursor:
             cursor.executemany(
-                statements[0],
-                list(mapping_df[tracking_cols].itertuples(index=False))
-            )
-            cursor.executemany(
-                statements[1],
-                list(mapping_df[["taxon_id", "inat_name"]].itertuples(index=False))
-            )
-            cursor.executemany(
-                statements[2],
-                list(mapping_df[["taxon_id", "est_id", "described"]].itertuples(index=False))
+                statement,
+                list(tracking_df[tracking_cols].itertuples(index=False))
             )
             count = cursor.rowcount
 
         return count
+
+    def insert_mappings(self, mapping_df: pd.DataFrame) -> int:
+        """
+        Inserts new taxon mappings into the database. Returns number of rows inserted, or -1 
+        if the dataframe is empty.
+        """
+        if mapping_df is None or len(mapping_df) == 0:
+            return -1
+
+        statements = [
+            """
+            INSERT OR IGNORE INTO inat_taxa (taxon_id, inat_name)
+            VALUES (?, ?)
+            ON CONFLICT(taxon_id) 
+            DO UPDATE SET 
+                inat_name = excluded.inat_name;
+            """,
+            """
+            INSERT OR IGNORE INTO tracking_rel (taxon_id, est_id)
+            VALUES (?, ?);
+            """
+        ]
+
+        with closing(self._conn.cursor()) as cursor:
+            cursor.executemany(
+                statements[0],
+                list(mapping_df[["taxon_id", "inat_name"]].itertuples(index=False))
+            )
+            cursor.executemany(
+                statements[1],
+                list(mapping_df[["taxon_id", "est_id"]].itertuples(index=False))
+            )
+            count = cursor.rowcount
+
+        return count
+
 
     def insert_alternatives(self, alternatives_df: pd.DataFrame) -> int:
         """

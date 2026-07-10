@@ -4,6 +4,10 @@ This module contains dataframe models that validate the data coming into and out
 This includes cleaning raw data coming from .csv files and the iNaturalist API, and converting to 
 and from the data types expected by a sqlite database.
 """
+#### Standard Imports ####
+import logging
+from typing import Optional
+
 #### Third-party imports ####
 import numpy as np
 import pandas as pd
@@ -12,12 +16,15 @@ import pandera.typing
 
 #### Constants ####
 # String format for storing datetimes in sqlite
-DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+DATE_FORMAT = "%Y-%m-%d"
 
 # Experts list default fields
 # TODO do this for tracking list
 EXPERTS_INAT_ID_FIELD = "iNaturalist_id"
 EXPERTS_EXPERTISE_FIELD = "Expertise LU"
+
+#### Setup ####
+logger = logging.getLogger("pipeline")
 
 # ---------------------------------------------------------------------------
 # Tracking
@@ -51,6 +58,10 @@ class TrackingSchemaClean(pa.DataFrameModel):
     est_id          : int = pa.Field(unique=True, ge=0)
     # Scientific name
     sci_name        : str
+    # Name searched for
+    search_name     : Optional[str]
+    # Whether the taxa is described
+    is_described    : Optional[bool] = pa.Field(coerce=True)
     # Category (e.g. plant, animal, fungi)
     element_type    : str = pa.Field(nullable=True, coerce=True)
     # Scientific name italicized with <i></i>
@@ -84,7 +95,7 @@ class TrackingSchemaClean(pa.DataFrameModel):
     def from_raw(
         cls,
         df: pandera.typing.DataFrame[TrackingSchemaRaw]
-    ) -> pandera.typing.DataFrame["TrackingSchemaClean"]:
+    ) -> pandera.typing.DataFrame['TrackingSchemaClean']:
         """
         Converts a raw tracking list dataframe to the clean schema and validates it.
         
@@ -130,14 +141,14 @@ class TrackingSchemaClean(pa.DataFrameModel):
 # ---------------------------------------------------------------------------
 # iNaturalist Taxa
 # ---------------------------------------------------------------------------
-class TaxonMappingSchema(TrackingSchemaClean):
+class TaxonMappingSchema(pa.DataFrameModel):
     """
     Schema for a table that maps tracking taxa to iNaturalist taxa retrieved from the iNaturalist
     taxa API.
     """
+    est_id          : pa.typing.Series[int]
     taxon_id        : pa.typing.Series[int]
     inat_name       : pa.typing.Series[str]
-    last_updated    : pa.typing.Series[pa.DateTime]
 
 # ---------------------------------------------------------------------------
 # Alternative names
@@ -159,6 +170,7 @@ class OverridesSchema(pa.DataFrameModel):
     """Manual overrides for tracking list taxon names."""
     est_id      : pa.typing.Series[int]
     inat_name	: pa.typing.Series[str]
+    taxon_id    : pa.typing.Series[int] = pa.Field(nullable=True, coerce=True)
 
     # pylint: disable=too-few-public-methods
     # pylint: disable=missing-class-docstring
@@ -169,22 +181,29 @@ class OverridesSchema(pa.DataFrameModel):
 # ---------------------------------------------------------------------------
 # Observations
 # ---------------------------------------------------------------------------
-def str_to_naive_datetime(df: pd.DataFrame, date_cols: list[str], tz: str = "UTC") -> pd.DataFrame:
+def str_to_datetime(df: pd.DataFrame, date_cols: list[str]) -> pd.DataFrame:
     """
-    Helper function that converts the given date columns to a naive pa.DateTime in the provided 
-    timezone.
+    Helper function that converts the given date columns to a naive pa.DateTime.
     """
+    pattern = r"(\d{4}-\d{2}-\d{2})"
+
     for col in date_cols:
         if not col in df.columns:
             raise ValueError(f"Dataframe does not contain expected column: {col}")
 
-        df[col] = (
-            pd.to_datetime(df[col], utc=True, errors="coerce")
-            .dt.tz_convert(tz)
-            .dt.tz_localize(None)
-        )
+        # Strip timezones and hours/minutes
+        df[col] = df[col].str.extract(pattern)
+        # Convert to datetime
+        df[col] = pd.to_datetime(df[col], errors="coerce")
+
     return df
 
+"""
+Formats that dates come in
+2016-11-15T00:30:31-08:00
+2026-06-11 15:04
+2026-06-11
+"""
 
 class ObservationSchema(pa.DataFrameModel):
     """
@@ -225,7 +244,7 @@ class ObservationSchema(pa.DataFrameModel):
         coerce = False
 
     @classmethod
-    def from_raw(cls, df: pd.DataFrame, tz: str = "UTC") -> pd.DataFrame:
+    def from_raw(cls, df: pd.DataFrame) -> pd.DataFrame:
         """
         Convert a raw observation dataframe from the API into this schema by converting
         string timestamps with timezones to naive localized datetimes, then validating the 
@@ -239,7 +258,7 @@ class ObservationSchema(pa.DataFrameModel):
             A validated copy of the dataframe that conforms to this schema.
         """
         df = df.copy()
-        df = str_to_naive_datetime(df, ["observed_on", "created_at", "updated_at"], tz)
+        df = str_to_datetime(df, ["observed_on", "created_at", "updated_at"])
         return cls.validate(df)
 
     @classmethod
@@ -256,7 +275,7 @@ class ObservationSchema(pa.DataFrameModel):
         """
         df = df.copy()
         for col in ["observed_on", "created_at", "updated_at"]:
-            df[col] = df[col].dt.strftime(DATETIME_FORMAT)
+            df[col] = df[col].dt.strftime(DATE_FORMAT)
 
         return df
 
@@ -275,7 +294,7 @@ class ObservationSchema(pa.DataFrameModel):
         """
         df = df.copy()
         for col in ["observed_on", "created_at", "updated_at"]:
-            df[col] = pd.to_datetime(df[col], format=DATETIME_FORMAT)
+            df[col] = pd.to_datetime(df[col], format=DATE_FORMAT)
 
         return cls.validate(df)
 
@@ -288,6 +307,7 @@ class FullObservationSchema(ObservationSchema, TrackingSchemaClean):
     """
     est_id          : pa.typing.Series[int] = pa.Field(unique=False, ge=0)
     observation_id  : pa.typing.Series[int] = pa.Field(unique=False, ge=0)
+    uuid            : pa.typing.Series[str] = pa.Field(unique=False)
     # TODO change to unqiue=True and test
     name            : pa.typing.Series[str] = pa.Field(nullable=True, coerce=True)
     login           : pa.typing.Series[str]
@@ -315,7 +335,6 @@ class IdentificationsSchema(pa.DataFrameModel):
     def from_raw(
         cls,
         df: pd.DataFrame,
-        tz: str = "UTC"
     ) -> pd.DataFrame:
         """
         Convert a raw identifications dataframe from the API into this schema by converting
@@ -330,7 +349,7 @@ class IdentificationsSchema(pa.DataFrameModel):
             A validated copy of the dataframe that conforms to this schema.
         """
         df = df.copy()
-        df = str_to_naive_datetime(df, ["created_at"], tz)
+        df = str_to_datetime(df, ["created_at"])
         return cls.validate(df)
 
 
@@ -350,7 +369,7 @@ class IdentificationsSchema(pa.DataFrameModel):
             A copy of the dataframe with sqlite-friendly date fields.
         """
         df = df.copy()
-        df["created_at"] = df["created_at"].dt.strftime(DATETIME_FORMAT)
+        df["created_at"] = df["created_at"].dt.strftime(DATE_FORMAT)
         return df
 
 
@@ -373,7 +392,7 @@ class IdentificationsSchema(pa.DataFrameModel):
         df = df.copy()
         if not "created_at" in df.columns:
             raise ValueError("Observations dataframe does not contain expected column: created_at")
-        df["created_at"] = pd.to_datetime(df["created_at"], format=DATETIME_FORMAT)
+        df["created_at"] = pd.to_datetime(df["created_at"], format=DATE_FORMAT)
         return df
 
 

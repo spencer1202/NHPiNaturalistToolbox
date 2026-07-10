@@ -1,7 +1,5 @@
 # iNaturalist Data Pipeline ORBIC
 
-**This repository is under construction!**
-
 A set of data aquisition and transformation tools for importing iNaturalist data into Biotics.
 
 The aim is to provide an easy automated way to create mappings between tracking list taxon names and iNaturalist taxon names, download new observations, filter for records identified by experts, and transform the dataset into a format for import into Biotics. It maintains a file-based SQLite database to integrate the iNaturalist data with the Biotics tracking list, name overrides list, and list of experts.

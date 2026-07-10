@@ -11,7 +11,7 @@ from inatdatapipeline.schemas.validation import (
     UsersSchema,
     ExpertsSchema,
     ExpertIDsSchema,
-    str_to_naive_datetime,
+    str_to_datetime,
 )
 from inatdatapipeline.client.observations import ObservationResults
 
@@ -27,39 +27,33 @@ from inatdatapipeline.client.observations import ObservationResults
 
 class TestCheckDates:
     def test_converts_to_datetime(self):
-        df = pd.DataFrame({"date": ["2024-03-15T00:00:00+00:00"]})
-        result = str_to_naive_datetime(df, ["date"])
+        df = pd.DataFrame({"date": ["2024-03-15"]})
+        result = str_to_datetime(df, ["date"])
         assert pd.api.types.is_datetime64_any_dtype(result["date"])
 
     def test_strips_timezone(self):
         df = pd.DataFrame({"date": ["2024-03-15T00:00:00+00:00"]})
-        result = str_to_naive_datetime(df, ["date"])
+        result = str_to_datetime(df, ["date"])
         assert result["date"].dt.tz is None
 
-    def test_converts_to_specified_timezone(self):
-        df = pd.DataFrame({"date": ["2024-03-15T12:00:00+00:00"]})
-        result_utc = str_to_naive_datetime(df.copy(), ["date"], tz="UTC")
-        result_pt  = str_to_naive_datetime(df.copy(), ["date"], tz="America/Los_Angeles")
-        # Pacific is UTC-8, so the hour should differ
-        assert result_utc["date"].iloc[0] != result_pt["date"].iloc[0]
 
     def test_raises_on_missing_column(self):
         df = pd.DataFrame({"other_col": ["value"]})
         with pytest.raises(ValueError, match="does not contain expected column"):
-            str_to_naive_datetime(df, ["date"])
+            str_to_datetime(df, ["date"])
 
     def test_multiple_columns(self):
         df = pd.DataFrame({
             "created_at": ["2024-03-16T10:00:00+00:00"],
             "updated_at": ["2024-03-17T10:00:00+00:00"],
         })
-        result = str_to_naive_datetime(df, ["created_at", "updated_at"])
+        result = str_to_datetime(df, ["created_at", "updated_at"])
         assert pd.api.types.is_datetime64_any_dtype(result["created_at"])
         assert pd.api.types.is_datetime64_any_dtype(result["updated_at"])
 
     def test_coerces_invalid_dates_to_nat(self):
         df = pd.DataFrame({"date": ["not-a-date"]})
-        result = str_to_naive_datetime(df, ["date"])
+        result = str_to_datetime(df, ["date"])
         assert pd.isna(result["date"].iloc[0])
 
 
@@ -118,11 +112,6 @@ class TestObservationSchemaFromRaw:
         result = ObservationSchema.from_raw(raw_observation_df)
         assert result["captive_cultivated"].dtype == bool
 
-    def test_respects_timezone_parameter(self, raw_observation_df):
-        result_utc = ObservationSchema.from_raw(raw_observation_df.copy(), tz="UTC")
-        result_pt  = ObservationSchema.from_raw(raw_observation_df.copy(), tz="America/Los_Angeles")
-        assert not result_utc["created_at"].equals(result_pt["created_at"])
-
     def test_does_not_mutate_input(self, raw_observation_df):
         original = raw_observation_df["created_at"].copy()
         ObservationSchema.from_raw(raw_observation_df)
@@ -143,16 +132,16 @@ class TestObservationSchemaToSqlite:
     def test_observed_on_format(self, clean_observation_df):
         result = ObservationSchema.to_sqlite(clean_observation_df)
         # Should be YYYY-MM-DD
-        pd.to_datetime(result["observed_on"], format="%Y-%m-%d %H:%M:%S")
+        pd.to_datetime(result["observed_on"], format="%Y-%m-%d")
 
     def test_created_at_format(self, clean_observation_df):
         result = ObservationSchema.to_sqlite(clean_observation_df)
-        # Should be YYYY-MM-DD HH:MM:SS
-        pd.to_datetime(result["created_at"], format="%Y-%m-%d %H:%M:%S")
+        # Should be YYYY-MM-DD
+        pd.to_datetime(result["created_at"], format="%Y-%m-%d")
 
     def test_updated_at_format(self, clean_observation_df):
         result = ObservationSchema.to_sqlite(clean_observation_df)
-        pd.to_datetime(result["updated_at"], format="%Y-%m-%d %H:%M:%S")
+        pd.to_datetime(result["updated_at"], format="%Y-%m-%d")
 
     def test_does_not_mutate_input(self, clean_observation_df):
         original_dtype = clean_observation_df["created_at"].dtype

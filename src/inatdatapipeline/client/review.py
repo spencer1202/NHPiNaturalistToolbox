@@ -84,12 +84,13 @@ class Review:
             .apply(lambda x: x.isna().any())
         )
         obs_status = self.observations["observation_id"].map(disagreements)
+        print(obs_status.head(20))
 
         self.observations["expert_verified"] = np.select(
             [
                 obs_status.isna(),         # observation not in expert ids
-                bool(obs_status) is True,  # observation in expert ids, at least 1 id doesn't agree
-                bool(obs_status) is False  # observation in expert ids and all ids agree
+                obs_status == True,  # observation in expert ids, at least 1 id doesn't agree
+                obs_status == False  # observation in expert ids and all ids agree
             ],
             ["No", "Disagreement", "Yes"],
             default="No"
@@ -339,6 +340,7 @@ class Review:
 
         df_clean.to_csv(file_path, index=False)
         return df_clean
+
 
     @staticmethod
     def clean_names(df: pd.DataFrame):

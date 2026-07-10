@@ -48,12 +48,18 @@ def tracking_df():
         "inat_name":         [None, None, None],
     })
 
+@pytest.fixture
+def tracking_df_preprocessed(tracking_df):
+    df = tracking_df.copy()
+    df["search_name"] = ["Aster alpinus vierhapperi", "Carex stipata", "Salix"]
+
 
 @pytest.fixture
 def overrides_df():
     return pd.DataFrame({
         "est_id":    [1],
         "inat_name": ["Aster alpinus"],
+        "taxon_id":  [None]
     })
 
 
@@ -62,6 +68,7 @@ def raw_observation_df():
     """Minimal valid raw observation dataframe with string dates."""
     return pd.DataFrame({
         "observation_id":               [1, 2],
+        "uuid":                         ["j483js81", "hjfs923j589"],
         "observer_id":                  [10, 11],
         "taxon_id":                     [99, 100],
         "license":                      ["cc-by", None],
@@ -163,7 +170,10 @@ def experts_clean(experts_raw):
 def full_observation_from_sqlite_df():
     return pd.DataFrame({
         "observation_id":               [1, 2],
+        "uuid":                         ["j483js81", "hjfs923j589"],
         "observer_id":                  [10, 11],
+        "name":                         ["Brad", "Jess"],
+        "login":                        ["Brad1234", "animallover99"],
         "taxon_id":                     [1, 2],
         "license":                      ["cc-by", None],
         "latitude":                     [37.8, 38.0],
@@ -184,9 +194,9 @@ def full_observation_from_sqlite_df():
         "obscured":                     [0, 1],
         "has_photo":                    [1, 0],
         "has_recording":                [0, 1],
-        "observed_on":                  ["2024-03-15 12:00:00", "2024-03-16 15:30:00"],
-        "created_at":                   ["2024-03-16 17:00:00", "2024-03-17 14:00:00"],
-        "updated_at":                   ["2024-03-17 12:00:00", "2024-03-18 19:13:00"],
+        "observed_on":                  ["2024-03-15", "2024-03-16"],
+        "created_at":                   ["2024-03-16", "2024-03-17"],
+        "updated_at":                   ["2024-03-17", "2024-03-18"],
         "est_id":                       [1, 2],
         "sci_name":                     ["Aster alpinus var. vierhapperi", "Carex stipata"],
         "element_type":                 ["Plant", "Plant"],

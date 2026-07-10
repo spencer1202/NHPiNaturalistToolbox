@@ -8,7 +8,6 @@ import pytest
 
 from inatdatapipeline.client.observations import (
     ObservationResults,
-    ObservationResultsClean,
     _get_batches,
     _create_date_taxon_map,
     _apply_date_filter,
@@ -527,18 +526,3 @@ class TestFetchObservations:
                 fetch_observations(auth, taxa_df, config)
 
         pd.testing.assert_series_equal(taxa_df["date_updated"], original_dates)
-
-
-# ---------------------------------------------------------------------------
-# ObservationResultsClean
-# ---------------------------------------------------------------------------
-
-class TestObservationResultsClean:
-    def test_validate(self, observation_results_raw):
-        
-        observation_results_clean: ObservationResultsClean = ObservationResultsClean.validate(observation_results_raw, "America/Los_Angeles")
-
-        print(observation_results_clean.observations.info())
-        print(observation_results_clean.identifications.info())
-        print(observation_results_clean.users.info())
-        print(observation_results_clean.annotations.info())

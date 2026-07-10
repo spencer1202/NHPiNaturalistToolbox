@@ -10,7 +10,6 @@ from typing import (
     TypeVar,
     Tuple
 )
-from zoneinfo import ZoneInfo
 from pathlib import Path
 
 #### Third-party imports ####
@@ -20,7 +19,6 @@ from pydantic import (
     FilePath,
     StringConstraints,
     ValidationError,
-    field_validator
 )
 
 # ---------------------------------------------------------------------------
@@ -132,16 +130,6 @@ class ObservationsConfig(BaseModel):
     update_after_days   : int
     project_id          : int
     max_observations    : int
-    timezone            : NonEmptyString
-
-    @field_validator("timezone")
-    @classmethod
-    def validate_tz(cls, v):
-        """
-        Makes sure the value is a valid timezone string using ZoneInfo.
-        """
-        ZoneInfo(v)
-        return v
 
 
 class TaxaConfig(BaseModel):

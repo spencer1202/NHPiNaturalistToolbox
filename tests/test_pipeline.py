@@ -69,15 +69,15 @@ def cfg_obs():
 
 @pytest.fixture
 def mapping_result():
-    return taxa.MappingResult(
-        new_mappings=pd.DataFrame({
+    return pd.DataFrame(
+        {
             "est_id":       [1],
             "taxon_id":     [123],
             "inat_name":    ["Carex stipata"],
             "last_updated": [pd.Timestamp("2024-01-01")],
-        }),
-        alt_names=None,
+        }
     )
+
 
 
 @pytest.fixture(scope="session")
@@ -132,26 +132,21 @@ class TestBuildTaxonMapping:
             with patch.object(validation.TrackingSchemaClean, "from_raw", return_value=tracking_df):
                 with patch.object(validation, "TrackingSchemaRaw", return_value=tracking_df):
                     with patch.object(validation, "OverridesSchema", return_value=overrides_df):
-                        with patch.object(taxa.TaxonMappingBuilder, "preprocess", return_value=tracking_df):
-                            with patch.object(taxa.TaxonMappingBuilder, "build_mapping", return_value=mapping_result):
-                                with patch.object(validation.TaxonMappingSchema, "validate", return_value=mapping_result.new_mappings):
-                                    pipeline.build_taxon_mapping(cfg_taxa, db_manager, auth, rebuild=False)
+                        with patch.object(taxa.TaxonMappingBuilder, "get_new_mappings", return_value=mapping_result):
+                            with patch.object(validation.TaxonMappingSchema, "validate", return_value=mapping_result):
+                                pipeline.build_taxon_mapping(cfg_taxa, db_manager, auth, rebuild=False)
 
         db_manager.select.assert_called_once_with("mappings")
 
     def test_skips_existing_mappings_when_rebuilding(self, cfg_taxa, db_manager, auth, tracking_df, overrides_df, mapping_result):
         with patch("pandas.read_csv", side_effect=[tracking_df, overrides_df]):
-            with patch.object(validation.TrackingSchemaClean, "from_raw", return_value=tracking_df):
-                with patch.object(validation, "TrackingSchemaRaw", return_value=tracking_df):
-                    with patch.object(validation, "OverridesSchema", return_value=overrides_df):
-                        with patch.object(taxa.TaxonMappingBuilder, "preprocess", return_value=tracking_df):
-                            with patch.object(taxa.TaxonMappingBuilder, "build_mapping", return_value=mapping_result) as mock_build:
-                                with patch.object(validation.TaxonMappingSchema, "validate", return_value=mapping_result.new_mappings):
-                                    pipeline.build_taxon_mapping(cfg_taxa, db_manager, auth, rebuild=True)
+            with patch.object(validation, "TrackingSchemaRaw", return_value=tracking_df):
+                with patch.object(validation, "OverridesSchema", return_value=overrides_df):
+                    with patch.object(taxa.TaxonMappingBuilder, "get_new_mappings", return_value=mapping_result) as mock_build:
+                        pipeline.build_taxon_mapping(cfg_taxa, db_manager, auth, rebuild=True)
 
-        # mapping_df should be None when rebuilding
-        called_mapping_df = mock_build.call_args[0][2]
-        assert called_mapping_df is None
+        # tracking df should be the same as to_match when rebuild is true
+        assert len(tracking_df) == len(mock_build.call_args[0][1])
 
     def test_returns_early_when_no_new_mappings(self, cfg_taxa, db_manager, auth, tracking_df, overrides_df):
         db_manager.select.return_value = pd.DataFrame({"est_id": [1]})
@@ -160,10 +155,9 @@ class TestBuildTaxonMapping:
             with patch.object(validation.TrackingSchemaClean, "from_raw", return_value=tracking_df):
                 with patch.object(validation, "TrackingSchemaRaw", return_value=tracking_df):
                     with patch.object(validation, "OverridesSchema", return_value=overrides_df):
-                        with patch.object(taxa.TaxonMappingBuilder, "preprocess", return_value=tracking_df):
-                            with patch.object(taxa.TaxonMappingBuilder, "build_mapping", return_value=None):
-                                # Should not raise and should not attempt db insert
-                                pipeline.build_taxon_mapping(cfg_taxa, db_manager, auth)
+                        with patch.object(taxa.TaxonMappingBuilder, "get_new_mappings", return_value=None):
+                            # Should not raise and should not attempt db insert
+                            pipeline.build_taxon_mapping(cfg_taxa, db_manager, auth)
 
         db_manager.insert_mappings.assert_not_called()
 
@@ -174,9 +168,8 @@ class TestBuildTaxonMapping:
             with patch.object(validation.TrackingSchemaClean, "from_raw", return_value=tracking_df):
                 with patch.object(validation, "TrackingSchemaRaw", return_value=tracking_df):
                     with patch.object(validation, "OverridesSchema", return_value=overrides_df):
-                        with patch.object(taxa.TaxonMappingBuilder, "preprocess", return_value=tracking_df):
-                            with pytest.raises(ValueError, match="Failed to load mappings"):
-                                pipeline.build_taxon_mapping(cfg_taxa, db_manager, auth, rebuild=False)
+                        with pytest.raises(ValueError, match="Failed to load mappings"):
+                            pipeline.build_taxon_mapping(cfg_taxa, db_manager, auth, rebuild=False)
 
     def test_raises_on_db_error_inserting_mappings(self, cfg_taxa, db_manager, auth, tracking_df, overrides_df, mapping_result):
         db_manager.select.return_value = pd.DataFrame({"est_id": []})
@@ -186,11 +179,9 @@ class TestBuildTaxonMapping:
             with patch.object(validation.TrackingSchemaClean, "from_raw", return_value=tracking_df):
                 with patch.object(validation, "TrackingSchemaRaw", return_value=tracking_df):
                     with patch.object(validation, "OverridesSchema", return_value=overrides_df):
-                        with patch.object(taxa.TaxonMappingBuilder, "preprocess", return_value=tracking_df):
-                            with patch.object(taxa.TaxonMappingBuilder, "build_mapping", return_value=mapping_result):
-                                with patch.object(validation.TaxonMappingSchema, "validate", return_value=mapping_result.new_mappings):
-                                    with pytest.raises(ValueError, match="Failed to insert mappings"):
-                                        pipeline.build_taxon_mapping(cfg_taxa, db_manager, auth)
+                        with patch.object(taxa.TaxonMappingBuilder, "get_new_mappings", return_value=mapping_result):
+                            with pytest.raises(ValueError, match="Failed to insert mappings"):
+                                pipeline.build_taxon_mapping(cfg_taxa, db_manager, auth)
 
 
 

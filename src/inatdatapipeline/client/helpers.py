@@ -38,7 +38,7 @@ def sliding_page_requests(url: str, params: dict, headers: dict) -> list:
         iterations += 1
 
         last_id = results[-1].get("id")
-        logger.debug("Page %i fetched. Last ID: %i. Total so far: %i.",
+        logger.debug("\tPage %i fetched. Last ID: %i. Total so far: %i.",
                      iterations, last_id, len(all_results))
 
         params["id_above"] = last_id
@@ -97,7 +97,7 @@ def page_requests(url: str, params: dict, headers: dict, per_page: int) -> list:
     return all_results
 
 
-def fetch_project_members(auth: INaturalistAuth, per_page: int, project_id: int) -> set:
+def fetch_project_members(auth: INaturalistAuth, project_id: int) -> set:
     """
     Get the user IDs of all users in the iNaturalist project.
     Args:
@@ -110,7 +110,7 @@ def fetch_project_members(auth: INaturalistAuth, per_page: int, project_id: int)
     headers = auth.get_auth_headers()
 
     # Make API requests
-    all_results = page_requests(url, {}, headers, per_page)
+    all_results = page_requests(url, {}, headers, 100)
 
     # Extract user IDs from API response
     users = set()

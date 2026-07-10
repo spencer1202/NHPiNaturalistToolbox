@@ -117,30 +117,45 @@ def build_taxon_mapping(
         ValueError: If the tracking list or overrides file can't be loaded, if either fails schema
         validation, if any database operation fails.
     """
-    taxon_mapper = taxa.TaxonMappingBuilder()
-
     # Load, validate and clean tracking list & overrides file
     tracking_df, overrides_df = (
         get_tracking_dfs(cfg_taxa.tracking_list, cfg_taxa.name_overrides_file)
     )
 
-    # Insert name overrides & preprocess
-    logger.info("Preprocessing taxa...")
-    tracking_df = taxon_mapper.preprocess(tracking_df, overrides_df)
+    # Insert name overrides, preprocess names, and identify undescribed taxa
+    logger.debug("Preprocessing tracking list...")
+    tracking_df = taxa.TaxonMappingBuilder.preprocess_tracking_df(tracking_df, overrides_df)
 
-    if rebuild:
-        mapping_df = None
-    else:
-        mapping_df = get_existing_mappings(db_manager)
+    # Insert tracking list into database
+    logger.debug("Inserting tracking list into database...")
+    try:
+        with db_manager as conn:
+            tracking_count = conn.insert_tracking(tracking_df)
+    except sqlite3.Error as ex:
+        raise ValueError("Failed to insert tracking list into database.") from ex
+    logger.debug("* Inserted/updated %i taxa from the tracking list.", tracking_count)
 
+    # Load existing mappings
+    mapping_df = None if rebuild else get_existing_mappings(db_manager)
     if mapping_df is None:
-        logger.info("Rebuilding taxon mappings from scratch...")
+        logger.info("Rebuilding taxon mappings from scratch.")
     else:
-        logger.debug("* Retrieved %i taxon mappings from database.", len(mapping_df))
+        logger.debug("Retrieved %i taxon mappings from database.", len(mapping_df))
 
-    # Build mappings
+    # Generate new mappings
+    override_id_map = taxa.TaxonMappingBuilder.build_override_id_map(overrides_df)
+    to_match = taxa.TaxonMappingBuilder.get_to_match(tracking_df, mapping_df)
+
+    if len(to_match) == 0:
+        logger.warning("All taxa on tracking list are already present in mappings.")
+        return
+    logger.debug(
+        "Found %i tracking list entries not present in existing mappings.",
+        len(to_match)
+    )
+    logger.info("Beginning taxon queries...")
     result: taxa.MappingResult = (
-        taxon_mapper.build_mapping(tracking_df, auth, mapping_df)
+        taxa.TaxonMappingBuilder.get_new_mappings(auth, to_match, override_id_map)
     )
 
     # No new taxa or alternative names.
@@ -149,18 +164,12 @@ def build_taxon_mapping(
         return
 
     # Validate mappings
-    new_mappings_clean = validation.TaxonMappingSchema.validate(result.new_mappings)
-    alt_names_clean = (
-        validation.AlternativeNamesSchema.validate(result.alt_names)
-        if result.alt_names is not None
-        else None
-    )
+    new_mappings_clean = validation.TaxonMappingSchema.validate(result)
 
     # Insert mappings into database
     try:
         with db_manager as conn:
             mappings_count = conn.insert_mappings(new_mappings_clean)
-            alternatives_count = conn.insert_alternatives(alt_names_clean)
 
     except sqlite3.Error as ex:
         raise ValueError("Failed to insert mappings into database.") from ex
@@ -170,9 +179,6 @@ def build_taxon_mapping(
         logger.info("Inserted %i new mappings.", mappings_count)
     else:
         logger.info("No new mappings inserted.")
-
-    if alternatives_count:
-        logger.info("Inserted %i new name alternatives.", alternatives_count)
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +226,7 @@ class ObservationResultsValidator:
 
 
     @staticmethod
-    def validate(obs: observations.ObservationResults, tz: str) -> Self:
+    def validate(obs: observations.ObservationResults) -> Self:
         """
         Initializes and populates an ObservationResultsClean object with validated dataframes from
         the provided ObservationResults object. 
@@ -229,13 +235,13 @@ class ObservationResultsValidator:
         result.observations = (
             result.get_validated_df(
                 obs.observations,
-                validation.ObservationSchema.from_raw, {"tz": tz}
+                validation.ObservationSchema.from_raw
             )
         )
         result.identifications = (
             result.get_validated_df(
                 obs.identifications,
-                validation.IdentificationsSchema.from_raw, {"tz": tz}
+                validation.IdentificationsSchema.from_raw
             )
         )
         result.users = (
@@ -288,10 +294,8 @@ def get_observations(
     """
     logger.info("Downloading observations...")
     logger.info("* Update if last searched before: %s days ago", cfg_obs.update_after_days)
-    logger.info("* Convert to timezone: %s", cfg_obs.timezone)
     logger.info("* Maximum number of observations to download: %i", cfg_obs.max_observations)
     logger.info("* Project ID: %i", cfg_obs.project_id)
-    logger.info("")
 
     # Get iNat taxa from database
     try:
@@ -301,7 +305,11 @@ def get_observations(
         raise ValueError from err
 
     # Filter out undescribed taxa
-    taxa_df = taxa_df[taxa_df["described"] == 1]
+    total_taxa_count = len(taxa_df)
+    logger.info("* Total taxa with known iNaturalist entry: %i", total_taxa_count)
+    taxa_df = taxa_df[taxa_df["is_described"] == 1]
+    logger.info("* Undescribed taxa: %i", total_taxa_count - len(taxa_df))
+    logger.info("")
 
     # Make sure taxa df isn't empty
     if len(taxa_df) == 0:
@@ -327,7 +335,7 @@ def get_observations(
     # Validate results
     try:
         results_clean: ObservationResultsValidator = (
-            ObservationResultsValidator.validate(results, cfg_obs.timezone)
+            ObservationResultsValidator.validate(results)
         )
         results_sqlite: observations.ObservationResults = results_clean.to_sqlite()
     except pa.errors.SchemaError as ex:
@@ -352,7 +360,7 @@ def update_project_members(
     logger.info("* Project ID: %s", cfg_obs.project_id)
     logger.info("")
 
-    member_ids = helpers.fetch_project_members(auth, cfg_obs.per_page, cfg_obs.project_id)
+    member_ids = helpers.fetch_project_members(auth, cfg_obs.project_id)
     logger.debug("Found %i project members.", len(member_ids))
 
     try:
