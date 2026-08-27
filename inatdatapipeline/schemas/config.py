@@ -16,7 +16,6 @@ from pathlib import Path
 from pydantic import (
     BeforeValidator,
     BaseModel,
-    FilePath,
     StringConstraints,
     ValidationError,
 )
@@ -126,7 +125,6 @@ class ObservationsConfig(BaseModel):
     quality_grade       : NonEmptyString
     per_page            : int
     batch_size          : int
-    fields_json         : FilePath
     update_after_days   : int
     project_id          : int
     max_observations    : int
@@ -139,8 +137,10 @@ class TaxaConfig(BaseModel):
 
 class ReviewConfig(BaseModel):
     """Model for review command configurations"""
-    experts_file        : RequiredExistingCSV
-    export_csv          : RequiredNewCSV
+    experts_file            : RequiredExistingCSV
+    experts_id_field        : str
+    experts_expertise_field : str
+    export_csv              : RequiredNewCSV
 
 
 T = TypeVar('T', bound=BaseModel)
@@ -151,7 +151,7 @@ def validate_config(
         model_cls: Type[T] = None
 ) -> Tuple[CoreConfig, Optional[T]]:
     """
-    Validate the global core config section and optionally a specific subcommand.
+    Validate a config section.
     Arguments:
         obj:
             Dictionary containing the config objects (click context object)
@@ -160,26 +160,13 @@ def validate_config(
         model_cls:
             The pydantic config model to use to validate the config section.
     Returns:
-        A tuple containing a validated CoreConfig model and a model of the specified type.
+        A validated model of the specified type.
     """
-    errors = []
-    try:
-        core_config = CoreConfig(**obj["core"])
-    except ValidationError as err:
-        errors.extend(construct_error_message(err))
-        core_config = None
 
-    try:
-        if not section_name or not model_cls:
-            result = (core_config, None)
-        else:
-            section_data = obj.get(section_name, {})
-            subcommand_config = model_cls(**section_data)
-            result = (core_config, subcommand_config)
-    except ValidationError as err:
-        errors.extend(construct_error_message(err))
+    if not section_name or not model_cls:
+        raise ValueError("Missing section name or config model type!")
 
-    if len(errors) > 0:
-        raise ValidationError("\n".join(errors))
+    section_data = obj.get(section_name, {})
+    result = model_cls(**section_data)
 
     return result

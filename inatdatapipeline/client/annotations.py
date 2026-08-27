@@ -38,10 +38,12 @@ def fetch_annotations(auth: INaturalistAuth) -> AnnotationOptions:
         response = requests.get(url, headers=headers, timeout=TIMEOUT)
         response.raise_for_status()
     except requests.exceptions.RequestException as ex:
-        raise ValueError(f"Encountered unknown request exception: {ex}") from ex
+        raise ValueError("Request to fetch annotation options failed.") from ex
 
     data = response.json()
     results = data.get("results", [])
+    if not results:
+        raise ValueError("Annotation API response did not contain results.")
 
     annotations = AnnotationOptions()
     for result in results:
@@ -54,6 +56,10 @@ def fetch_annotations(auth: INaturalistAuth) -> AnnotationOptions:
 
         # Get values for this annotation
         values = result.get("values")
+        if not values:
+            raise ValueError(
+                f"Annotation has no values. (ID={result.get('id')}, label={result.get('label')})"
+            )
         for value in values:
             val = {
                 "value_id": value.get("id"),

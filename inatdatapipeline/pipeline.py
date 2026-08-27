@@ -6,13 +6,18 @@ Handles orchestration between client, database, and validation layers.
 import logging
 import sqlite3
 from typing import Self, Optional
+import datetime as dt
 
 # Third-party imports
 import pandas as pd
 import pandera as pa
 
 # Local imports
-from inatdatapipeline import db
+from inatdatapipeline.database import db
+from inatdatapipeline.schemas import (
+    config,
+    validation
+)
 from inatdatapipeline.client import (
     annotations,
     authentication,
@@ -20,10 +25,6 @@ from inatdatapipeline.client import (
     observations,
     review,
     taxa
-)
-from inatdatapipeline.schemas import (
-    config,
-    validation
 )
 
 logger = logging.getLogger('pipeline')
@@ -90,7 +91,8 @@ def get_existing_mappings(
 
 
 def build_taxon_mapping(
-        cfg_taxa    : config.TaxaConfig,
+        tracking_csv: str,
+        overrides_csv: str,
         db_manager  : db.DBManager,
         auth        : authentication.INaturalistAuth,
         rebuild     : bool = False
@@ -117,9 +119,13 @@ def build_taxon_mapping(
         ValueError: If the tracking list or overrides file can't be loaded, if either fails schema
         validation, if any database operation fails.
     """
+    logger.info("Building taxon map...")
+    logger.info("* Tracking list file: %s", tracking_csv)
+    logger.info("* Overrides list file: %s", overrides_csv)
+    logger.info("")
     # Load, validate and clean tracking list & overrides file
     tracking_df, overrides_df = (
-        get_tracking_dfs(cfg_taxa.tracking_list, cfg_taxa.name_overrides_file)
+        get_tracking_dfs(tracking_csv, overrides_csv)
     )
 
     # Insert name overrides, preprocess names, and identify undescribed taxa
@@ -130,10 +136,10 @@ def build_taxon_mapping(
     logger.debug("Inserting tracking list into database...")
     try:
         with db_manager as conn:
-            tracking_count = conn.insert_tracking(tracking_df)
+            count = conn.insert_tracking(tracking_df)
     except sqlite3.Error as ex:
         raise ValueError("Failed to insert tracking list into database.") from ex
-    logger.debug("* Inserted/updated %i taxa from the tracking list.", tracking_count)
+    logger.debug("* Inserted/updated %i taxa from the tracking list.", count)
 
     # Load existing mappings
     mapping_df = None if rebuild else get_existing_mappings(db_manager)
@@ -154,12 +160,24 @@ def build_taxon_mapping(
         len(to_match)
     )
     logger.info("Beginning taxon queries...")
-    result: taxa.MappingResult = (
+    result, request_count = (
         taxa.TaxonMappingBuilder.get_new_mappings(auth, to_match, override_id_map)
     )
 
-    # No new taxa or alternative names.
-    if result is None:
+    logger.info("")
+    logger.info("Search complete.")
+    logger.info("* Request count: %s", request_count)
+
+    # Insert request count into DB
+    today = dt.date.today()
+    with db_manager as conn:
+        prev_request_count = conn.get_request_count(today)
+        total_requests = prev_request_count + request_count
+        conn.update_request_count(total_requests, today)
+    logger.info("* Total requests today (%s): %s", today, total_requests)
+
+    # No new taxa.
+    if len(result) == 0:
         logger.info("No new mappings found.")
         return
 
@@ -169,110 +187,54 @@ def build_taxon_mapping(
     # Insert mappings into database
     try:
         with db_manager as conn:
-            mappings_count = conn.insert_mappings(new_mappings_clean)
+            count = conn.insert_mappings(new_mappings_clean)
 
     except sqlite3.Error as ex:
         raise ValueError("Failed to insert mappings into database.") from ex
 
     # Log results
-    if mappings_count:
-        logger.info("Inserted %i new mappings.", mappings_count)
+    if count:
+        logger.info("* Inserted %i new mappings.", count)
     else:
-        logger.info("No new mappings inserted.")
+        logger.info("* No new mappings inserted.")
 
 
 # ---------------------------------------------------------------------------
 # Observations
 # ---------------------------------------------------------------------------
 
-class ObservationResultsValidator:
+def log_obs_download_results(
+        results: observations.ObservationResults,
+        downloader: observations.ObservationDownloader,
+        prev_request_count: int
+) -> int:
     """
-    Helper class that converts the dataframes in an ObservationResults object (from the observations 
-    module) into validated dataframes, then into sqlite-friendly formats.
+    Logs observation download stats and returns the total number of requests made today.
     """
-    def __init__(self):
-        """
-        Just creates an empty validator. Avoid using this, instead use the <code>validate</code> 
-        static method to create an object from ObservationResults.
-        """
-        self.observations       : pd.DataFrame = None
-        self.identifications    : pd.DataFrame = None
-        self.users              : pd.DataFrame = None
-        self.annotations        : pd.DataFrame = None
-        self.completed_taxa     : set = None
+    # No requests made
+    if len(results.observations) == 0 and downloader.request_count == prev_request_count:
+        logger.info("No searches performed.")
+        return 0
 
+    logger.info("Search complete.")
 
-    def to_sqlite(self) -> observations.ObservationResults:
-        """
-        Converts each dataframe to a SQLite-friendly version, using the schema's to_sqlite
-        method if present.
-        """
-        result = observations.ObservationResults()
-        result.observations = (
-            validation.ObservationSchema
-            .to_sqlite(self.observations)
-            .to_dict(orient="records")
-        )
-        result.identifications = (
-            validation.IdentificationsSchema
-            .to_sqlite(self.identifications)
-            .to_dict(orient="records")
-        )
-        result.users = self.users.to_dict(orient="records")
-        result.annotations = self.annotations.to_dict(orient="records")
-        result.completed_taxa = self.completed_taxa
+    # logger.info("Exceeded maximum number of observations for this run. " +
+    # "Wrapping up queries...")
+    today = dt.date.today()
+    total_requests = downloader.request_count + prev_request_count
+    logger.info("* Request count: %s", downloader.request_count)
+    logger.info("* Total requests today (%s): %s", today, total_requests)
 
-        return result
+    if len(results.observations) == 0:
+        logger.info("* No results found.")
+        return 0
 
+    logger.info("* Taxa searched for: %s", downloader.taxa_completed)
+    logger.info("* Exceeded max download count: %s", downloader.exceeded_download_max)
+    logger.info("* Remaining unupdated taxa: %s", downloader.taxa_remaining)
+    logger.info("")
 
-    @staticmethod
-    def validate(obs: observations.ObservationResults) -> Self:
-        """
-        Initializes and populates an ObservationResultsClean object with validated dataframes from
-        the provided ObservationResults object. 
-        """
-        result = ObservationResultsValidator()
-        result.observations = (
-            result.get_validated_df(
-                obs.observations,
-                validation.ObservationSchema.from_raw
-            )
-        )
-        result.identifications = (
-            result.get_validated_df(
-                obs.identifications,
-                validation.IdentificationsSchema.from_raw
-            )
-        )
-        result.users = (
-            result.get_validated_df(
-                obs.users,
-                validation.UsersSchema.from_raw
-            )
-        )
-        result.annotations = (
-            result.get_validated_df(
-                obs.annotations,
-                validation.AnnotationsSchema.validate
-            )
-        )
-        result.completed_taxa = obs.completed_taxa
-        return result
-
-
-    @staticmethod
-    def get_validated_df(df, func, kwargs = None) -> pd.DataFrame:
-        """
-        Helper function that applies the given validation function to the dataframe using the 
-        arguments in kwargs.
-        """
-        if not kwargs:
-            kwargs = {}
-
-        if df is None or len(df) == 0:
-            return None
-
-        return func(pd.DataFrame(df), **kwargs)
+    return total_requests
 
 
 def get_observations(
@@ -296,52 +258,58 @@ def get_observations(
     logger.info("* Update if last searched before: %s days ago", cfg_obs.update_after_days)
     logger.info("* Maximum number of observations to download: %i", cfg_obs.max_observations)
     logger.info("* Project ID: %i", cfg_obs.project_id)
+    logger.info("* Place ID: %s", cfg_obs.place_id)
+    logger.info("")
 
-    # Get iNat taxa from database
+    today = dt.date.today()
+
+    # Get iNat taxa and request count from database
+    logger.info("Retrieving and filtering download list...")
     try:
         with db_manager as conn:
             taxa_df = conn.select("mappings")
+            prev_request_count = db_manager.get_request_count(today)
     except sqlite3.Error as err:
         raise ValueError from err
 
-    # Filter out undescribed taxa
-    total_taxa_count = len(taxa_df)
-    logger.info("* Total taxa with known iNaturalist entry: %i", total_taxa_count)
-    taxa_df = taxa_df[taxa_df["is_described"] == 1]
-    logger.info("* Undescribed taxa: %i", total_taxa_count - len(taxa_df))
-    logger.info("")
+    downloader = observations.ObservationDownloader(cfg_obs, auth)
 
-    # Make sure taxa df isn't empty
+    # Filter out taxa we don't want to download observations for
+    taxa_df = downloader.filter_taxa(taxa_df)
+
+    # Check if there are actually taxa to be searched for
     if len(taxa_df) == 0:
-        raise ValueError("No taxa found in database to download!")
-
-    # Download observations
-    results: observations.ObservationResults = (
-        observations.fetch_observations(auth, taxa_df, cfg_obs)
-    )
-
-    if results is None:
-        logger.warning(
-            "All taxa have already been updated in the past %s days. " +
-            "Try changing update_after_days in the config file, or run with " +
-            "'--days-since-update' option."
-            , cfg_obs.update_after_days
-        )
+        logger.warning("No taxa left to download observations for. " +
+            "All taxa are either undescribed or have been updated less than %s days ago.",
+            cfg_obs.update_after_days)
         return
 
-    logger.info("Finished downloading!")
+    logger.info("* Total taxa with iNaturalist mapping: %i", downloader.total_taxa_count)
+    logger.info("* Undescribed taxa (will be skipped when downloading): %i",
+        downloader.undescribed_taxa_count)
+    logger.info("* Number of taxa to be updated: %i", downloader.filtered_taxa_count)
     logger.info("")
 
-    # Validate results
+    # Download
+    results = downloader.fetch_observations(taxa_df)
+    total_requests = log_obs_download_results(results, downloader, prev_request_count)
+
+    if len(results.observations) == 0:
+        return
+
+    # Validate
     try:
-        results_clean: ObservationResultsValidator = (
-            ObservationResultsValidator.validate(results)
+        results_clean: observations.ObservationResultsValidator = (
+            observations.ObservationResultsValidator.validate(results)
         )
         results_sqlite: observations.ObservationResults = results_clean.to_sqlite()
     except pa.errors.SchemaError as ex:
         raise ValueError("Results of observations query don't fit the expected schema.") from ex
 
+    # Insert into database
     db_manager.insert_observation_results(results_sqlite)
+    with db_manager as conn:
+        conn.update_request_count(total_requests, today)
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +317,7 @@ def get_observations(
 # ---------------------------------------------------------------------------
 
 def update_project_members(
-        cfg_obs: config.ObservationsConfig,
+        project_id: int,
         db_manager: db.DBManager,
         auth: authentication.INaturalistAuth
 ):
@@ -357,10 +325,10 @@ def update_project_members(
     Fetches list of project members from iNaturalist and inserts it into the database.
     """
     logger.info("Updating project members...")
-    logger.info("* Project ID: %s", cfg_obs.project_id)
+    logger.info("* Project ID: %s", project_id)
     logger.info("")
 
-    member_ids = helpers.fetch_project_members(auth, cfg_obs.project_id)
+    member_ids = helpers.fetch_project_members(auth, project_id)
     logger.debug("Found %i project members.", len(member_ids))
 
     try:
@@ -409,24 +377,27 @@ def update_annotations(
 # Review
 # ---------------------------------------------------------------------------
 
-def update_experts(experts_file: str, db_manager: db.DBManager) -> pd.DataFrame:
+def update_experts(
+        experts_file: str,
+        id_field: str,
+        expertise_field: str,
+        db_manager: db.DBManager
+) -> pd.DataFrame:
     """
     Load experts from file, validate the data, and insert the experts into the database.
 
     Args:
         experts_file: File path of experts list. See validation.EXPERTS_INAT_ID_FIELD and 
         validation.EXPERTS_EXPERTISE_FIELD for expected raw column names.
-
+        id_field: Name of column in `experts_file` holding the iNaturalist user ID.
+        expertise_field: Name of column in `experts_file` holding the expertise value.
         db_manager: Database manager object.
     
     Returns:
         Experts dataframe. See validation.ExpertsSchema for resulting schema.
-    
-    Raises:
-        TODO update
     """
     experts_df = pd.read_csv(experts_file, encoding="utf-8")
-    experts_clean_df = validation.ExpertsSchema.from_raw(experts_df)
+    experts_clean_df = validation.ExpertsSchema.from_raw(experts_df, id_field, expertise_field)
 
     with db_manager as conn:
         count = conn.update_experts(experts_clean_df)
@@ -436,7 +407,9 @@ def update_experts(experts_file: str, db_manager: db.DBManager) -> pd.DataFrame:
     return experts_clean_df
 
 
-def _get_data(db_manager: db.DBManager) -> tuple[set, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def _get_data(
+        db_manager: db.DBManager
+) -> tuple[set, pd.DataFrame, pd.DataFrame, pd.DataFrame] | None:
     """
     Helper function that loads and validates the data needed for the review. 
 
@@ -459,26 +432,23 @@ def _get_data(db_manager: db.DBManager) -> tuple[set, pd.DataFrame, pd.DataFrame
 
         # Make sure project members have been loaded properly
         if project_members_df is None or len(project_members_df) == 0:
-            raise ValueError(
-                "No project members in database. Try running the update-members command first."
-            )
+            raise ValueError("No project members in database.")
         project_members_set: set = set(project_members_df["user_id"])
 
         # Make sure annotations have been loaded
         if not has_annotations:
-            raise ValueError(
-                "iNaturalist annotations haven't been loaded. Try running the " +
-                "update-annotations command first."
-            )
+            raise ValueError("iNaturalist annotations haven't been loaded.")
 
-        # Validate observations and expert IDs
+        # Validate observations
         if observations_df is None or len(observations_df) == 0:
             raise ValueError("No observations present in database.")
-        if expert_ids_df is None or len(expert_ids_df) == 0:
-            raise ValueError("No expert identifications present in database.")
-
         observations_clean_df = validation.FullObservationSchema.from_sqlite(observations_df)
-        expert_ids_clean_df = validation.ExpertIDsSchema.from_sqlite(expert_ids_df)
+
+        # Create empty expert IDs dataframe if there are no expert IDs
+        if expert_ids_df is None or len(expert_ids_df) == 0:
+            expert_ids_clean_df = validation.ExpertIDsSchema.empty()
+        else:
+            expert_ids_clean_df = validation.ExpertIDsSchema.from_sqlite(expert_ids_df)
 
     except sqlite3.Error as ex:
         raise ValueError("Database error occurred while running review.") from ex
@@ -524,7 +494,12 @@ def run_review(
     logger.info("")
     # Update experts
     logger.info("Loading experts list...")
-    update_experts(cfg_review.experts_file, db_manager)
+    update_experts(
+        cfg_review.experts_file,
+        cfg_review.experts_id_field,
+        cfg_review.experts_expertise_field,
+        db_manager
+    )
 
     logger.info("Loading observation data from database...")
     (
@@ -534,18 +509,10 @@ def run_review(
         annotations_df
     ) = _get_data(db_manager)
 
-    # Clean expert names
-    # Fill in identifier_name column with the user's name if present, otherwise use the login
-
-    reviewer = review.Review(observations_df)
-
     logger.info("Running review...")
-    expert_ids_df["identifier_name"] = reviewer.clean_names(expert_ids_df)
-    reviewer.compile_annotations(annotations_df)
-    reviewer.evaluate_expert_agreement(expert_ids_df)
-    reviewer.add_identified_by(expert_ids_df)
-    reviewer.add_identification_references(expert_ids_df)
-    reviewer.evaluate_licenses(project_members_set)
+    reviewer = review.Reviewer(observations_df)
+    reviewer.run_review(expert_ids_df, annotations_df, project_members_set)
 
     logger.info("Exporting reviewed observations...")
-    reviewer.export(cfg_review.export_csv)
+    export_df = reviewer.format_for_export()
+    export_df.to_csv(cfg_review.export_csv, index=False)

@@ -2,11 +2,14 @@
 This module provides methods for interacting with the local database.
 """
 import sqlite3
+from typing import Type
 import logging
 from contextlib import closing
 import datetime as dt
 import re
+import os
 import pandas as pd
+import arcpy
 from inatdatapipeline.client import (
     observations,
     annotations
@@ -17,329 +20,24 @@ sqlite3.register_adapter("date", lambda b: dt.date.fromisoformat(b.decode()))
 
 logger = logging.getLogger("pipeline")
 
-create_statements = {
-    "tracking_taxa":
-        """
-        CREATE TABLE IF NOT EXISTS tracking_taxa (
-            est_id                int     NOT NULL PRIMARY KEY,
-            sci_name              text,
-            search_name           text,
-            is_described          boolean CHECK (is_described IN (NULL, true, false)),
-            element_type          text,
-            scientific_name       text,
-            common_name           text,
-            element_name          text,
-            family                text,
-            author                text,
-            egt_uid               int     NOT NULL,
-            srank                 text,
-            track_status          text,
-            explorer              text,
-            explorer_link         text,
-            elcode                text    NOT NULL,
-            growth_habit          text,
-            duration              text
-        );
-        """,
-
-    "inat_taxa":        
-        """
-        CREATE TABLE IF NOT EXISTS inat_taxa (
-            taxon_id              int     PRIMARY KEY NOT NULL,
-            inat_name             text,
-            date_updated          text
-        );
-        """,
-
-    "tracking_rel":
-        """
-        CREATE TABLE IF NOT EXISTS tracking_rel (
-            taxon_id              int     NOT NULL REFERENCES inat_taxa(taxon_id),
-            est_id                int     NOT NULL REFERENCES tracking_taxa(est_id),
-            PRIMARY KEY(taxon_id, est_id)
-        );
-        """,
-
-    "tracking_trigger": 
-        """
-        CREATE TRIGGER IF NOT EXISTS fk_cascade_delete_tracking
-        AFTER DELETE ON inat_taxa
-        BEGIN
-            DELETE FROM tracking_rel WHERE taxon_id = OLD.taxon_id;
-        END;
-        """,
-
-    "inat_taxa_alternatives":
-        """
-        CREATE TABLE IF NOT EXISTS inat_taxa_alternatives (
-            taxon_id                int     NOT NULL REFERENCES inat_taxa(taxon_id),
-            alternative_taxon_id    int     NOT NULL,
-            alternative_inat_name   str
-        )
-        """,
-
-    "users":
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            user_id               int     PRIMARY KEY NOT NULL,
-            login                 text,
-            name                  text
-        );
-        """,
-
-    "observations":
-        """
-        CREATE TABLE IF NOT EXISTS observations (
-            observation_id              int     PRIMARY KEY NOT NULL,
-            uuid                        text    NOT NULL,
-            observer_id                 int     NOT NULL REFERENCES users(user_id),
-            taxon_id                    int     NOT NULL REFERENCES inat_taxa(taxon_id),
-            license                     text,
-            latitude                    float,
-            longitude                   float,
-            latitude_private            float,
-            longitude_private           float,
-            coordinate_precision        float,
-            coordinate_precision_public float,
-            observed_on                 text,
-            observed_on_string          text,
-            created_at                  text,
-            updated_at                  text,
-            quality_grade               text,
-            url                         text,
-            description                 text,
-            id_agreements               int,
-            id_disagreements            int,
-            place_guess                 text,
-            place_guess_private         text,
-            captive_cultivated          boolean CHECK (captive_cultivated IN (NULL, true, false)),
-            obscured                    boolean CHECK (obscured IN (NULL, true, false)),
-            has_photo                   boolean CHECK (has_photo IN (NULL, true, false)),
-            has_recording               boolean CHECK (has_recording IN (NULL, true, false))
-        );
-        """,
-
-    "experts":
-        """
-        CREATE TABLE IF NOT EXISTS experts (
-            user_id               int     PRIMARY KEY,
-            expertise             text
-        );
-        """,
-
-    "identifications":
-        """
-        CREATE TABLE IF NOT EXISTS identifications (
-            identification_id     int     PRIMARY KEY NOT NULL,
-            observation_id        int     NOT NULL REFERENCES observations(observation_id),
-            user_id               int     NOT NULL REFERENCES users(user_id),
-            taxon_id              int     NOT NULL REFERENCES inat_taxa(taxon_id),
-            created_at            text
-        );
-        """,
-
-    "mappings":
-        """
-        CREATE VIEW IF NOT EXISTS mappings (
-            est_id, 
-            elcode, 
-            sci_name, 
-            search_name,
-            is_described,
-            common_name, 
-            taxon_id, 
-            inat_name, 
-            date_updated
-        ) AS SELECT 
-            tt.est_id, 
-            tt.elcode, 
-            tt.sci_name, 
-            tt.search_name,
-            tt.is_described,
-            tt.common_name, 
-            it.taxon_id, 
-            it.inat_name, 
-            it.date_updated
-        FROM tracking_taxa AS tt
-        JOIN tracking_rel AS tr ON tt.est_id = tr.est_id
-        JOIN inat_taxa AS it ON tr.taxon_id = it.taxon_id;
-        """,
-
-    "project_members":
-        """
-        CREATE TABLE IF NOT EXISTS project_members (
-            user_id int PRIMARY KEY NOT NULL
-        );
-        """,
-
-    "not_in_inat":
-        """
-        CREATE VIEW IF NOT EXISTS not_in_inat 
-        AS SELECT * 
-        FROM tracking_taxa AS tt
-        LEFT JOIN tracking_rel AS tr
-        ON tt.est_id = tr.est_id
-        WHERE tr.est_id IS NULL;
-        """,
-
-    "expert_identifications":
-        """
-        CREATE VIEW IF NOT EXISTS expert_identifications (
-            identification_id,
-            observation_id,
-            user_id,
-            login,
-            name,
-            taxon_id,
-            created_at,
-            est_id,
-            elcode,
-            expertise
-        )
-        AS SELECT
-            id.identification_id,
-            id.observation_id,
-            id.user_id,
-            us.login,
-            us.name,
-            id.taxon_id,
-            id.created_at,
-            tr.est_id,
-            tr.elcode,
-            ex.expertise
-        FROM identifications AS id
-        LEFT JOIN tracking_rel 
-            ON id.taxon_id = tracking_rel.taxon_id
-        LEFT JOIN tracking_taxa AS tr 
-            ON tracking_rel.est_id = tr.est_id
-        JOIN experts AS ex 
-            ON id.user_id = ex.user_id
-        JOIN users AS us
-            ON id.user_id = us.user_id;
-        """,
-
-    "annotation_options":
-        """
-        CREATE TABLE IF NOT EXISTS annotation_options (
-            annotation_id       int     PRIMARY KEY NOT NULL,
-            label               text    NOT NULL
-        )
-        """,
-
-    "annotation_values":
-        """
-        CREATE TABLE IF NOT EXISTS annotation_values (
-            annotation_id       int     NOT NULL REFERENCES annotations(annotation_id),
-            value_id            int     NOT NULL,
-            label               text    NOT NULL,
-            PRIMARY KEY(value_id, annotation_id)
-        )
-        """,
-
-    "annotations":
-        """
-        CREATE TABLE IF NOT EXISTS annotations (
-            annotation_id       int     NOT NULL,
-            value_id            int     NOT NULL,
-            observation_id      int     NOT NULL,
-            user_id             int     NOT NULL,
-            vote_score          int     NOT NULL,
-            PRIMARY KEY(annotation_id, value_id, observation_id),
-            FOREIGN KEY(annotation_id, value_id) 
-                REFERENCES annotation_values(annotation_id, value_id)
-        )
-        """,
-
-    "annotations_with_labels":
-        """
-        CREATE VIEW IF NOT EXISTS annotations_with_labels (
-            observation_id,
-            annotation_id,
-            value_id,
-            annotation_label,
-            value_label,
-            user_id,
-            vote_score
-        )
-        AS SELECT
-            ann.observation_id,
-            ann.annotation_id,
-            ann.value_id,
-            ao.label,
-            av.label,
-            ann.user_id,
-            ann.vote_score
-        FROM annotations ann
-        JOIN annotation_values av
-            ON ann.value_id = av.value_id
-        JOIN annotation_options ao
-            ON ann.annotation_id = ao.annotation_id
-        """,
-
-    "full_observations":
-        """
-        CREATE VIEW IF NOT EXISTS full_observations
-        AS SELECT
-            obs.observation_id,
-            obs.uuid,
-            obs.observer_id,
-            us.name,
-            us.login,
-            obs.taxon_id,
-            obs.license,
-            obs.latitude,
-            obs.longitude,
-            obs.latitude_private,
-            obs.longitude_private,
-            obs.coordinate_precision,
-            obs.coordinate_precision_public,
-            obs.observed_on,
-            obs.observed_on_string,
-            obs.created_at,
-            obs.updated_at,
-            obs.quality_grade,
-            obs.url,
-            obs.description,
-            obs.id_agreements,
-            obs.id_disagreements,
-            obs.place_guess,
-            obs.place_guess_private,
-            obs.captive_cultivated,
-            obs.obscured,
-            obs.has_photo,
-            obs.has_recording,
-            tt.est_id,
-            tt.element_type,
-            tt.sci_name,
-            tt.search_name,
-            tt.is_described,
-            tt.scientific_name,
-            tt.common_name,
-            tt.element_name,
-            tt.family,
-            tt.author,
-            tt.egt_uid,
-            tt.srank,
-            tt.track_status,
-            tt.explorer,
-            tt.explorer_link,
-            tt.elcode,
-            tt.growth_habit,
-            tt.duration
-        FROM observations obs
-        JOIN users us
-            ON obs.observer_id = us.user_id
-        LEFT JOIN tracking_rel tr1
-            ON obs.taxon_id = tr1.taxon_id
-        LEFT JOIN inat_taxa_alternatives ita
-            ON obs.taxon_id = ita.alternative_taxon_id AND tr1.taxon_id IS NULL
-        LEFT JOIN tracking_rel tr2
-            ON ita.taxon_id = tr2.taxon_id AND ita.taxon_id IS NOT NULL
-        JOIN tracking_taxa tt
-            ON tt.est_id = COALESCE(tr1.est_id, tr2.est_id);
-        """
-}
-
+TABLE_WHITELIST = [
+    "tracking_taxa",
+    "inat_taxa",
+    "tracking_rel",
+    "users",
+    "observations",
+    "identifications",
+    "annotations",
+    "annotation_options",
+    "annotation_values",
+    "experts",
+    "project_members",
+    "mappings",
+    "not_in_inat",
+    "expert_identifications",
+    "annotations_with_labels",
+    "full_observations"
+]
 
 class DBManager:
     """
@@ -381,6 +79,9 @@ class DBManager:
         if self._conn:
             self._conn.close()
 
+        if not os.path.exists(self.db_file):
+            arcpy.management.CreateSQLiteDatabase(self.db_file, spatial_type="GEOPACKAGE")
+
         try:
             self._conn = sqlite3.connect(self.db_file)
         except sqlite3.Error as err:
@@ -388,7 +89,7 @@ class DBManager:
             raise
 
 
-    def setup_db(self):
+    def setup_db(self, sql_file_path: str):
         """
         Sets up the iNat database if by creating tables if they don't already exist. Automatically 
         commits transaction.
@@ -396,11 +97,16 @@ class DBManager:
         self.check_connection()
 
         try:
+            # Read SQL schema file
+            with open(sql_file_path, "r", encoding="utf-8") as fp:
+                sql = fp.read()
+
+            # Execute SQL instructions
             with closing(self._conn.cursor()) as cursor:
-                for _, statement in create_statements.items():
-                    cursor.execute(statement)
+                cursor.executescript(sql)
+
         except sqlite3.Error as ex:
-            raise sqlite3.Error(f"Error while creating tables: {ex}")
+            raise sqlite3.Error("Error while creating tables.") from ex
 
 
     def check_connection(self):
@@ -603,7 +309,7 @@ class DBManager:
             raise ValueError(f"Table doesn't exist in database: \'{table}\'")
 
         # Check table string against list of valid tables
-        if create_statements.get(table) is None:
+        if table not in TABLE_WHITELIST:
             raise ValueError(f"Invalid table name: \'{table}\'")
 
         try:
@@ -618,23 +324,22 @@ class DBManager:
         Replace project_members table with new entries
         """
         insert_statement =  """
-                            INSERT OR IGNORE INTO project_members (user_id)
-                            VALUES (?);
-                            """
+            INSERT OR IGNORE INTO project_members (user_id)
+            VALUES (?);
+            """
 
         self.check_connection()
 
         try:
             with closing(self._conn.cursor()) as cursor:
                 ids = [(id,) for id in member_ids]
-                cursor.execute("DROP TABLE IF EXISTS project_members;")
-                cursor.execute(create_statements["project_members"])
+                cursor.execute("DELETE FROM project_members")
                 cursor.executemany(insert_statement, ids)
                 count = cursor.rowcount
             return count
 
         except sqlite3.Error as ex:
-            raise sqlite3.Error(f"Error while updating project members: {ex}")
+            raise sqlite3.Error("Error while updating project members.") from ex
 
 
     def insert_users(self, users: list):
@@ -658,7 +363,7 @@ class DBManager:
             return count
 
         except sqlite3.Error as ex:
-            raise sqlite3.Error(f"Error while inserting into users table: {ex}")
+            raise sqlite3.Error("Error while inserting into users table.") from ex
 
 
     def insert_observations(self, obs_list: list[dict]) -> int:
@@ -757,7 +462,7 @@ class DBManager:
                 cursor.executemany(statement, obs_list)
                 count = cursor.rowcount
         except sqlite3.Error as err:
-            raise sqlite3.Error(f"Error while inserting into observations table: {err}")
+            raise sqlite3.Error("Error while inserting into observations table.") from err
 
         return count
 
@@ -796,7 +501,7 @@ class DBManager:
                 cursor.executemany(statement, identifications)
                 count = cursor.rowcount
         except sqlite3.Error as err:
-            raise sqlite3.Error(f"Error while inserting into identifications table: {err}")
+            raise sqlite3.Error("Error while inserting into identifications table.") from err
 
         return count
 
@@ -833,7 +538,7 @@ class DBManager:
                 cursor.executemany(statement, ann_list)
                 count = cursor.rowcount
         except sqlite3.Error as err:
-            raise sqlite3.Error(f"Error while inserting into annotations table: {err}")
+            raise sqlite3.Error("Error while inserting into annotations table.") from err
 
         return count
 
@@ -857,8 +562,7 @@ class DBManager:
             with closing(self._conn.cursor()) as cursor:
                 cursor.execute(statement, [dt.date.today()] + list(complete_taxa))
         except sqlite3.Error as err:
-            msg = f"Error while updating taxon last checked dates: {err}"
-            raise sqlite3.Error(msg)
+            raise sqlite3.Error("Error while updating taxon last checked dates.") from err
 
 
     def get_expert_identifications(self):
@@ -868,20 +572,19 @@ class DBManager:
         self.check_connection()
         try:
             self._conn.create_function("REGEXP_MATCH", 2, DBManager.match_wildcards)
-            self._conn.execute(create_statements["expert_identifications"])
+
         except sqlite3.Error as ex:
-            msg = f"Error while creating expert identification filter statement: {ex}"
-            raise sqlite3.Error(msg)
+            msg = "Error while creating expert identification filter statement."
+            raise sqlite3.Error(msg) from ex
 
         query = """
-        SELECT * FROM expert_identifications
-        WHERE REGEXP_MATCH(elcode, expertise) = 1;
-        """
+            SELECT * FROM expert_identifications
+            WHERE REGEXP_MATCH(elcode, expertise) = 1;
+            """
         try:
             df = self._select_query(query)
         except sqlite3.Error as ex:
-            msg = f"Error while querying expert identifications: {ex}"
-            raise sqlite3.Error(msg)
+            raise sqlite3.Error("Error while querying expert identifications.") from ex
 
         return df
 
@@ -899,8 +602,7 @@ class DBManager:
         tuples = df.to_dict(orient="records")
 
         with closing(self._conn.cursor()) as cursor:
-            cursor.execute("DROP TABLE IF EXISTS experts")
-            cursor.execute(create_statements["experts"])
+            cursor.execute("DELETE FROM experts")
             cursor.executemany(statement, tuples)
             count = cursor.rowcount
 
@@ -930,7 +632,7 @@ class DBManager:
                 safe_p = p.replace(r"%", ".*")
                 regex_parts.append(safe_p)
 
-            combined_regex = f"^({"|".join(regex_parts)})$"
+            combined_regex = "^(%s)$" % "|".join(regex_parts)
             return 1 if re.match(combined_regex, elcode) else 0
 
         except:
@@ -946,10 +648,6 @@ class DBManager:
         annotation values into the database.
         """
         self.check_connection()
-        # Set up tables
-        self._conn.execute(create_statements["annotation_options"])
-        self._conn.execute(create_statements["annotation_values"])
-        self._conn.execute(create_statements["annotations_with_labels"])
 
         statements = [
             """
@@ -981,7 +679,7 @@ class DBManager:
             obs_count = db.insert_observations(results.observations)
             user_count = (
                 db.insert_users(results.users)
-                if len(results.annotations) > 0 else 0
+                if len(results.users) > 0 else 0
             )
             ident_count = (
                 db.insert_identifications(results.identifications)
@@ -999,3 +697,63 @@ class DBManager:
         logger.info("Observations:     %i", obs_count)
         logger.info("Identifications:  %i", ident_count)
         logger.info("Annotations:      %i", annotation_count)
+
+    @staticmethod
+    def extract_val(result: tuple, val_type: Type):
+        """Helper function that extracts a value from a single-value query result"""
+        if not result:
+            if val_type is int:
+                return 0
+            return None
+
+        try:
+            result_str = result[0]
+            result_val = val_type(result_str)
+        except (ValueError, KeyError) as ex:
+            raise ValueError(
+                f"Statistic in database is in an unexpected format: {result_str}"
+            ) from ex
+
+        return result_val
+
+
+    def get_request_count(self, today: dt.date) -> int:
+        """
+        Fetches today's request count from the stats table. If the current request count date is
+        different from the 'today' parameter, returns 0.
+        """
+        self.check_connection()
+        today_str = today.strftime("%d/%m/%Y")
+
+        with closing(self._conn.cursor()) as cursor:
+            # Get current request count
+            cursor.execute("SELECT stat_value FROM stats WHERE stat_key = 'request_count'")
+            count = self.extract_val(cursor.fetchone(), int)
+
+            # Get current request count date
+            cursor.execute("SELECT stat_value FROM stats WHERE stat_key = 'request_count_date'")
+            date_str = self.extract_val(cursor.fetchone(), str)
+            
+        if not date_str or today_str == date_str:
+            return count
+        return 0
+
+
+    def update_request_count(self, count: int, date: dt.date):
+        """
+        Updates today's request count in the stats table.
+        """
+        self.check_connection()
+
+        replace_count_sql =  """
+            INSERT OR REPLACE INTO stats (stat_key, stat_value)
+            VALUES ('request_count', ?)
+        """
+        replace_date_sql = """
+            INSERT OR REPLACE INTO stats (stat_key, stat_value)
+            VALUES ('request_count_date', ?)
+        """
+        date_str = date.strftime("%d/%m/%Y")
+        with closing(self._conn.cursor()) as cursor:
+            cursor.execute(replace_count_sql, (str(count),))
+            cursor.execute(replace_date_sql, (date_str,))

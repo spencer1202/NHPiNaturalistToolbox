@@ -1,7 +1,6 @@
 """
 This module contains the INaturalistAuth class which takes care of getting authentication for 
-iNaturalist requests. It also has functions that perform smaller miscelaneous API request tasks, 
-and some request paging helper functions.
+iNaturalist requests.
 """
 #### Standard imports ####
 import getpass
@@ -12,8 +11,7 @@ from typing import Optional
 #### Third-party imports ####
 import keyring
 import requests
-from dotenv import load_dotenv
-from pyinaturalist import KEYRING_KEY
+KEYRING_KEY = "/inaturalist"
 
 #### Constants ####
 TIMEOUT = 30
@@ -21,6 +19,7 @@ TIMEOUT = 30
 #### Setup ####
 logger = logging.getLogger('pipeline')
 
+env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
 # ---------------------------------------------------------------------------
 # iNaturalist Authentication
@@ -65,27 +64,22 @@ class INaturalistAuth:
     def generate_access_token(self, user: str) -> str | None:
         """
         Fetches iNaturalist authorization access token using credentials from the system keyring. 
-        If not present, prompts the user for credentials and saves them to the system keyring.
+        Raises ValueError if credentials not present.
         """
-        # Try to load app secret and ID from .env file
+        # Try to load app secret and ID from environment
         if (
-            not load_dotenv('.env')
-            or not os.environ.get("INAT_APP_ID")
-            or not os.environ.get("INAT_APP_SECRET")
+            not os.getenv("INAT_APP_ID")
+            or not os.getenv("INAT_APP_SECRET")
         ):
-            raise ValueError("App credentials not present in environment file.")
+            msg = "No iNaturalist App ID or App Secret found in environment variables."
+            raise ValueError(msg)
 
         password = keyring.get_password(KEYRING_KEY, user)
-        if not password:
-            print(f"No saved credentials found for {user}.")
-            password = self._get_credentials(user)
 
         try:
             self.access_token = self._get_oauth_token(user, password)
-        except requests.HTTPError:
-            print(f"Failed to authenticate credentials for {user}.")
-            password = self._get_credentials(user)
-            self.access_token = self._get_oauth_token(user, password)
+        except requests.HTTPError as ex:
+            raise ValueError(f"Failed to authenticate credentials for {user}.") from ex
 
         if not self.access_token:
             raise ValueError(f"Failed to obtain OAuth token for user '{user}'")

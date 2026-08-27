@@ -1,6 +1,5 @@
 """
-This module contains some miscellaneous helper functions that use the requests library to interact
-with the iNaturalist API.
+This module contains some miscellaneous helper functions that interact with the iNaturalist API.
 """
 import time
 import logging
@@ -16,9 +15,11 @@ logger.setLevel(logging.DEBUG)
 # Request helpers
 # ---------------------------------------------------------------------------
 
-def sliding_page_requests(url: str, params: dict, headers: dict) -> list:
+def sliding_page_requests(url: str, params: dict, headers: dict) -> tuple[list, int]:
     """
     Helper function for paging through observation requests, using id_above instead of pages.
+
+    Returns a tuple containing the results and the number of requests made.
     """
     all_results = []
     has_more = True
@@ -45,7 +46,7 @@ def sliding_page_requests(url: str, params: dict, headers: dict) -> list:
 
         time.sleep(1.0)
 
-    return all_results
+    return all_results, iterations
 
 
 def page_requests(url: str, params: dict, headers: dict, per_page: int) -> list:

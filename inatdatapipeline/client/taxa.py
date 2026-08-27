@@ -3,19 +3,26 @@ This module handles building a mapping between the Biotics and iNaturalist taxon
 """
 
 #!/usr/bin/env python3
+#### Standard imports ####
 import logging
 from typing import Optional
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+#### Third-party imports ####
 import requests
 import pandas as pd
 
+#### Local imports ####
 from inatdatapipeline.client.authentication import INaturalistAuth, TIMEOUT
 from inatdatapipeline.schemas.validation import TaxonMappingSchema
 
 # Set up logging
 logger = logging.getLogger('pipeline')
+
+# Taxa requests URL
+TAXA_URL = "https://api.inaturalist.org/v2/taxa"
 
 
 @dataclass
@@ -25,28 +32,6 @@ class Taxon:
     """
     taxon_id: int
     name: str
-
-# # TODO remove alternatives
-# @dataclass
-# class TaxonResult:
-#     """
-#     The results of taxon request, with a best match "primary" taxon and a possibly empty list of 
-#     alternative taxa.
-#     """
-#     primary: Optional[Taxon] = None
-#     alternatives: list[Taxon] = field(default_factory=list)
-
-
-# @dataclass
-# class MappingResult:
-#     """
-#     The results of building a taxon mapping. 
-
-#     * **new_mappings**: Dataframe with new taxon mappings.
-#     * **alt_names**:  Dataframe with alternative names for taxa that have them.
-#     """
-#     new_mappings: Optional[pd.DataFrame] = None
-#     alt_names: Optional[pd.DataFrame] = None
 
 
 # ---------------------------------------------------------------------------
@@ -75,9 +60,7 @@ class TaxonMappingBuilder:
         Returns:
             A Taxon object if a match is found, otherwise None.
         """
-
         # Set up parameters
-        url = "https://api.inaturalist.org/v2/taxa"
         headers = auth.get_auth_headers()
         params = {
             "per_page"  : 5,
@@ -92,16 +75,17 @@ class TaxonMappingBuilder:
 
         # Make API request
         try:
-            response = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
+            response = requests.get(TAXA_URL, params=params, headers=headers, timeout=TIMEOUT)
             response.raise_for_status()
             data = response.json()
             results = data.get("results", [])
             if not results:
                 return None
+
         except requests.RequestException as ex:
             logger.error("Error looking up '%s': %s", scientific_name, str(ex))
             return None
-        
+
         # Look for matching taxon in results
         taxon: Taxon                = None
         alternative: list[Taxon]   = []
@@ -113,8 +97,9 @@ class TaxonMappingBuilder:
             # Convert result_id to an integer
             try:
                 result_id_int = int(result_id)
-            except TypeError:
-                logger.error("Taxon ID '%s' is not valid.", result_id)
+            except (TypeError, ValueError):
+                logger.error(
+                    "Recieved invalid Taxon ID: '%s'. Skipping malformed result.", result_id)
                 continue
 
             # Handle NaN values and ensure we have valid data
@@ -135,10 +120,10 @@ class TaxonMappingBuilder:
             if (
                 (taxon_id and result_id_int == taxon_id)                # taxon ID match
                 or (result_name.lower() == scientific_name.lower())     # name exact match
-            ):    
+            ):
                 taxon = Taxon(result_id_int, result_name)
                 break
-            
+
             # Keep track of first alternative option
             if not alternative:
                 alternative = Taxon(result_id_int, result_name)
@@ -166,6 +151,12 @@ class TaxonMappingBuilder:
         """
         if not name or pd.isna(name):
             return None
+
+        # Edge case: name is a single-word string, return name as is
+        is_single_word = re.fullmatch(r"^[A-Za-z\-]+", name.strip())
+        if is_single_word:
+            logger.warning("Encountered single-word taxon name '%s' - marking as undescribed.", name.strip())
+            return name.strip()
 
         # Regular expression that extracts the genus name, species name, and subspecies name or
         # subspecies/population number.
@@ -246,7 +237,13 @@ class TaxonMappingBuilder:
 
         # Matches names with a number at the end, grabs all text before the number
         expr = r"^((?:[A-Za-z\-]+[\t ])+)\d+$"
-        return names.str.extract(expr, expand=False).str.strip().fillna("")
+        result = names.str.extract(expr, expand=False).str.strip()
+
+        # Second pass to check for single-word names
+        is_single_word = names.str.fullmatch(r"[A-Za-z\-]+").fillna(False)
+        result = result.fillna(names.where(is_single_word)).infer_objects(copy=False)
+
+        return result.fillna("")
 
 
     @staticmethod
@@ -254,7 +251,7 @@ class TaxonMappingBuilder:
         auth: INaturalistAuth,
         to_match: pd.DataFrame,
         override_map: dict = None
-    ) -> pd.DataFrame:
+    ) -> tuple[pd.DataFrame, int]:
         """
         Get taxon mappings by querying for the taxa in the provided dataframe. Structures responses
         into dataframes and validates them.
@@ -262,19 +259,17 @@ class TaxonMappingBuilder:
         Args:
             auth: 
                 An iNaturalist authentication object.
-
             to_match: 
                 Dataframe of tracking list taxa to be mapped to their iNaturalist counterparts.
-
             override_map: 
                 A possibly empty dictionary that maps tracking list taxa by their est_id to 
                 iNaturalist taxon_ids, which will be used to perform the search instead of the
                 taxon's name.
 
         Returns:
-            mappings_df:
-                A dataframe of mappings between Biotics taxa and iNaturalist taxa.
-
+            (mappings_df, request_count):
+                A dataframe of mappings between Biotics taxa and iNaturalist taxa, and the number
+                of requests made.
         """
         if override_map is None:
             override_map = {}
@@ -282,10 +277,10 @@ class TaxonMappingBuilder:
         # Process unmatched rows
         process_total = len(to_match)
         process_num = 1
+        request_count = 0
         new_taxa = []
         undescribed_names: dict[str, Taxon] = {}
 
-        #################### Querying ####################
         for _, row in to_match.iterrows():
             taxon: Taxon = None
             search_name = row["search_name"]
@@ -296,42 +291,42 @@ class TaxonMappingBuilder:
                 process_num,
                 process_total,
                 search_name,
-                f"({row["sci_name"]})" if row["sci_name"] != search_name else ""
+                ("(%s)" % row["sci_name"]) if row["sci_name"] != search_name else ""
             )
 
             # Check if this is an undescribed taxon, and if so if it has already been mapped.
             if row["is_described"]:
                 taxon = TaxonMappingBuilder.query_taxon(search_name, auth, override_id)
+                request_count += 1
+                logger.debug("* Request count: %s", request_count)
             else:
-                if not undescribed_names.get(search_name):
+                undescribed_taxon = undescribed_names.get(search_name)
+                if not undescribed_taxon:
                     taxon = TaxonMappingBuilder.query_taxon(search_name, auth, override_id)
-                    undescribed_names[search_name] = taxon
+                    # Cache placeholder taxon if no result found
+                    undescribed_names[search_name] = taxon if taxon else Taxon(0, "N/A") 
+                    request_count += 1
+                    logger.debug("* Request count: %s", request_count)
                 else:
-                    taxon = undescribed_names.get(search_name)
+                    taxon = undescribed_taxon
 
             # No result found
-            if not taxon:
+            if not taxon or not taxon.taxon_id:
                 logger.debug("* No result found.")
-                process_num += 1
-                time.sleep(1)
-                continue
+            else:
+                logger.debug("* Result found: name=%s, taxon_id=%i", taxon.name, taxon.taxon_id)
+                new_taxon = row.to_dict() # Copy all existing fields from to_match row
+                new_taxon["taxon_id"] = taxon.taxon_id # Add / overwrite mapping fields
+                new_taxon["inat_name"] = taxon.name
+                new_taxa.append(new_taxon)
 
-            logger.debug("* Result found: name=%s, taxon_id=%i", taxon.name, taxon.taxon_id)
-            # Copy all existing fields from to_match row
-            new_taxon = row.to_dict()
-            # Add / overwrite mapping fields
-            new_taxon["taxon_id"] = taxon.taxon_id
-            new_taxon["inat_name"] = taxon.name
-            new_taxa.append(new_taxon)
-
-            process_num += 1
             # Be kind to the API
             time.sleep(1)
+            process_num += 1
 
         if len(new_taxa) == 0:
-            return None
-
-        return pd.DataFrame(new_taxa)
+            return pd.DataFrame(), request_count
+        return pd.DataFrame(new_taxa), request_count
 
 
     @staticmethod
@@ -379,29 +374,3 @@ class TaxonMappingBuilder:
         to_match = tracking_df.loc[~match_mask, needed_cols].copy()
 
         return to_match
-
-
-    # # TODO update calling methods to use new signature
-    # def build_mapping(
-    #         self,
-    #         to_match: pd.DataFrame,
-    #         overrides_map: dict[int, int],
-    #         auth: INaturalistAuth
-    # ) -> Optional[MappingResult]:
-    #     """
-    #     Build a taxon mapping from the given tracking file including the existing mappings in
-    #     mapping_df. Return the new mappings in a MappingResult object.
-    #     """
-
-    #     if len(to_match) == 0:
-    #         logger.warning("All taxa on tracking list are already present in mappings.")
-    #         return None
-    #     logger.debug(
-    #         "Found %i tracking list entries not present in existing mappings.",
-    #         len(to_match)
-    #     )
-
-    #     # Generate new mappings
-    #     logger.info("")
-    #     logger.info("Beginning taxon queries...")
-    #     return TaxonMappingBuilder.get_new_mappings(to_match, auth)

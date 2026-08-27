@@ -1,6 +1,6 @@
 [project]
 name = "inatdatapipeline"
-version = "0.0.1"
+version = "1.0.0"
 authors = [
     { name = "Spencer Henwood", email = "henwood@pdx.edu" }
 ]
@@ -17,12 +17,12 @@ dependencies = [
     "click",
     "pydantic",
     "pandera",
-    "tzdata"
+    "arcpy"
 ]
 
 [tool.setuptools.packages.find]
-where = ["src"]
-include = ["src/inatdatapipeline"]  # ["*"] by default
+where = ["inatdatapipeline"]
+include = ["inatdatapipeline"]  # ["*"] by default
 exclude = ["tests"]
 
 
@@ -36,4 +36,4 @@ filterwarnings = [
 ]
 
 [tool.pytest.ini_options]
-pythonpath = [".", "src/inatdatapipeline"]
+pythonpath = [".", "inatdatapipeline"]

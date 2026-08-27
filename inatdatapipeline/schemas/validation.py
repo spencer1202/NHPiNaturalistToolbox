@@ -198,12 +198,10 @@ def str_to_datetime(df: pd.DataFrame, date_cols: list[str]) -> pd.DataFrame:
 
     return df
 
-"""
-Formats that dates come in
-2016-11-15T00:30:31-08:00
-2026-06-11 15:04
-2026-06-11
-"""
+# Formats that dates come in
+# 2016-11-15T00:30:31-08:00
+# 2026-06-11 15:04
+# 2026-06-11
 
 class ObservationSchema(pa.DataFrameModel):
     """
@@ -467,18 +465,35 @@ class ExpertsSchema(pa.DataFrameModel):
         strict = "filter"
 
     @classmethod
-    def from_raw(cls, df: pd.DataFrame):
+    def from_raw(
+        cls, 
+        df: pd.DataFrame, 
+        id_field: str = EXPERTS_INAT_ID_FIELD, 
+        expertise_field: str = EXPERTS_EXPERTISE_FIELD
+    ):
         """
-        Changes some columns names to be nicer
+        Convert a raw experts CSV into this schema.
+
+        Args:
+            df: Raw experts dataframe.
+            id_field: Name of column in `df` holding the iNaturalist user ID.
+            expertise_field: Name of column in `df` holding the expertise value.
         """
         df = df.copy()
-        renames = {
-            EXPERTS_INAT_ID_FIELD   : "user_id",
-            EXPERTS_EXPERTISE_FIELD : "expertise",
-        }
-        df = df.rename(columns=renames)
 
-        # Drop empty rows
+        missing = [col for col in (id_field, expertise_field) if col not in df.columns]
+        if missing:
+            raise ValueError(
+                f"Experts CSV is missing expected column(s): {missing}. "
+                f"Available columns: {list(df.columns)}"
+            )
+        
+        renames = {
+            id_field        : "user_id",
+            expertise_field : "expertise",
+        }
+
+        df = df.rename(columns=renames)
         df = df.dropna(how="all")
         return cls.validate(df)
 

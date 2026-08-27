@@ -1,7 +1,8 @@
 """
-This module provides the ability to run a full review on the observation data pulled from the 
-iNaturalist API by cross-referencing identifications against an experts list, evaluating
-licenses, compiling annotations, preparing the data for export, and exporting it to a csv.
+This module defines the Reviewer class, which runs a full review on the observation data 
+pulled from the iNaturalist API by cross-referencing identifications against an experts 
+list, evaluating licenses, compiling annotations, preparing the data for export, and 
+exporting it to a csv.
 """
 # Standard imports
 from typing import Optional
@@ -15,7 +16,7 @@ from inatdatapipeline.schemas.validation import ExportSchema
 
 DATE_FORMAT = "%Y-%m-%d"
 
-class Review:
+class Reviewer:
     """
     Runs a review of the observations. Provides functions for flagging observations identified by 
     experts, adding a column with expert names, adding an annotations column, inserting project 
@@ -28,28 +29,27 @@ class Review:
         """
         self.observations = observations_df
 
-    # ---------------------------------------------------------------------------
-    # Expert identifications
-    # ---------------------------------------------------------------------------
-    def _get_last_identification(self, expert_ids: pd.DataFrame) -> Optional[tuple[str, str]]:
-        """
-        Returns a tuple with the name and date of the last expert identification.
 
-        The expert identifications should be filtered for just one observation.
-        """
-        if expert_ids is None:
-            raise ValueError("Missing argument: expert_ids must not be None")
+    # def _get_last_identification(self, expert_ids: pd.DataFrame) -> Optional[tuple[str, str]]:
+    #     """
+    #     Returns a tuple with the name and date of the last expert identification.
 
-        if expert_ids.empty:
-            return None
+    #     The expert identifications should be filtered for just one observation. Must be run after
+    #     _add_identified_by has been called.
+    #     """
+    #     if expert_ids is None:
+    #         raise ValueError("Missing argument: expert_ids must not be None")
 
-        row = expert_ids.loc[
-            expert_ids["created_at"].idxmax()
-        ]
-        return (row["identifier_name"], row["created_at"].strftime("%Y-%m-%d"))
+    #     if expert_ids.empty:
+    #         return None
+
+    #     row = expert_ids.loc[
+    #         expert_ids["created_at"].idxmax()
+    #     ]
+    #     return (row["identifier_name"], row["created_at"].strftime("%Y-%m-%d"))
 
 
-    def add_identified_by(self, expert_ids: pd.DataFrame):
+    def _add_identified_by(self, expert_ids: pd.DataFrame):
         """
         Add identifiedBy and dateIdentified columns to the observations dataframe.
         """
@@ -73,8 +73,10 @@ class Review:
         self.observations.loc[unverified_mask, ["identifiedBy", "dateIdentified"]] = None
 
 
-    def evaluate_expert_agreement(self, expert_ids: pd.DataFrame):
+    def _evaluate_expert_agreement(self, expert_ids: pd.DataFrame):
         """
+        Modifies the observations dataframe using the provided expert IDs.
+        
         Adds an "expert_verified" column that's true if there is at least one expert identification
         and all expert identifications agree with the community taxon.
         """
@@ -90,13 +92,14 @@ class Review:
             [
                 obs_status.isna(),         # observation not in expert ids
                 obs_status == True,  # observation in expert ids, at least 1 id doesn't agree
-                obs_status == False  # observation in expert ids and all ids agree
+                obs_status == False   # observation in expert ids and all ids agree
+                #ik this is ugly but it's the only method that works for this ¯\_(ツ)_/¯
             ],
             ["No", "Disagreement", "Yes"],
             default="No"
         )
 
-    def add_identification_references(self, expert_ids: pd.DataFrame):
+    def _add_identification_references(self, expert_ids: pd.DataFrame):
         """
         Adds a new string field to observations called "identificationReferences", which is a list 
         of all the experts who left agreeing identifications on the observation (ordered by most 
@@ -118,20 +121,20 @@ class Review:
     # ---------------------------------------------------------------------------
     # Annotations
     # ---------------------------------------------------------------------------
-    def compile_annotations(self, annotations):
+    def _compile_annotations(self, annotations):
         """
         Adds a new field to observations called "annotations", which is a ; separated list of
         annotations left on the observation in the form 'category: value'.
         """
         self.observations["annotations"] = self.observations.apply(
-            lambda x: self._compile_anotations(
+            lambda x: self._construct_annotation_field(
                 annotations[annotations["observation_id"] == x["observation_id"]]
             ),
             axis="columns"
         )
 
 
-    def _compile_anotations(self, annotations_df: pd.DataFrame):
+    def _construct_annotation_field(self, annotations_df: pd.DataFrame):
         """
         Construct a string with all of the annotations in the dataframe. 
 
@@ -139,7 +142,7 @@ class Review:
         """
         strings = []
         for annotation in annotations_df.to_dict(orient="records"):
-            strings.append(f"{annotation["annotation_label"]}: {annotation["value_label"]}")
+            strings.append("%s: %s" % (annotation["annotation_label"], annotation["value_label"]))
 
         if len(strings) > 0:
             return "; ".join(strings)
@@ -163,14 +166,14 @@ class Review:
         return self.observations
 
 
-    def evaluate_licenses(self, project_members: set) -> pd.DataFrame:
+    def _evaluate_licenses(self, project_members: set) -> pd.DataFrame:
         """
         Adds a project license field to mark observations made by project members, then populates
         a "permission_to_use" field with True if the observation has an appropriate license and 
         false otherwise. Mutates and returns self.observations.
         """
         self._add_project_licenses(project_members)
-        allowed_licenses = ["cc0", "cc-by", "cc-by-nc"] #TODO add to configuration file
+        allowed_licenses = ["cc0", "cc-by", "cc-by-nc"] #TODO add to parameters
         allowed_mask = (
             self.observations["license"].isin(allowed_licenses)
             | self.observations["project_license"].isin(allowed_licenses)
@@ -182,22 +185,39 @@ class Review:
         )
         return self.observations
 
-
-    def export(self, file_path: str):
+    def run_review(
+            self, 
+            expert_ids_df: pd.DataFrame, 
+            annotations_df: pd.DataFrame, 
+            project_members: set
+    ):
         """
-        Put the observations dataframe into export format and export it to a csv at the given 
-        file path.
+        Modifies this objects observations dataframe. Reviews expert agreement, adds identified_by
+        and identification_references columns, compiles observation annotations, and evaluates
+        observation licenses.
         """
-        # TODO split into more specialized functions
-        df = self.observations.copy()
+        expert_ids_copy = expert_ids_df.copy()
 
-        # Convert dates to strings
-        for col in df.select_dtypes(include="datetime").columns:
-            df[col] = df[col].dt.strftime(DATE_FORMAT)
+        expert_ids_copy["identifier_name"] = self._clean_names(expert_ids_copy)
+        self._evaluate_expert_agreement(expert_ids_copy)
 
-        # Populate v_by
-        df["v_by"] = self.clean_names(df)
+        self._add_identified_by(expert_ids_copy)
+        self._add_identification_references(expert_ids_copy)
+        self._compile_annotations(annotations_df)
+        self._evaluate_licenses(project_members)
 
+# ---------------------------------------------------------
+
+    @staticmethod
+    def _merge_locations(df) -> pd.DataFrame:
+        """
+        Merges the public/private location fields (latitude/longiture, precision, place guess) 
+        where obscured coordinates are revealed. Location fields are replaced where their private
+        counterparts are populated. Rows are recategorized as obscured if they were previously
+        marked as obscured AND the private coordinates are not populated.
+        
+        Returns the modified dataframe (dataframe is modified in-place to conserve space).
+        """
         # Merge location fields where obscured coordinates are revealed
         priv_coords_populated_mask = (
             df["obscured"]
@@ -221,7 +241,7 @@ class Review:
             df["latitude_private"],
             df["latitude"]
         )
-        df["latitude"] = np.where(
+        df["longitude"] = np.where(
             priv_coords_populated_mask,
             df["longitude_private"],
             df["longitude"]
@@ -243,11 +263,15 @@ class Review:
             df["coordinate_precision_public"]
         )
 
-        # Fill null string fields with empty string
-        for col in df.select_dtypes(include=[str, "object"]).columns:
-            df[col] = df[col].fillna("")
+        return df
 
-        # Populate static columns
+    @staticmethod
+    def _add_static_columns(df) -> pd.DataFrame:
+        """
+        Adds any required columns where all values are the same.
+
+        Returns the modified dataframe (dataframe is modified in-place to conserve space).
+        """
         df["search_type"] = "Element"
         df["Dataset"] = "iNaturalist"
         df["dist_unit"] = "Meters"
@@ -257,7 +281,16 @@ class Review:
         df["detected_ind"] = "Y"
         df["ownerInstitutionCode"] = "iNaturalist"
 
-        # Populate evidence type
+        return df
+
+    @staticmethod
+    def _add_evidence_type(df) -> pd.DataFrame:
+        """
+        Creates a new "evidence_type" field based on whether each observation had a photo, a
+        recording, or both.
+
+        Returns the modified dataframe (dataframe is modified in-place to conserve space).
+        """
         photo_mask = df["has_photo"]
         recording_mask = df["has_recording"]
         df["evidence_type"] = np.select(
@@ -273,7 +306,15 @@ class Review:
             ],
             default=""
         )
+        return df
 
+    @staticmethod
+    def _rename_columns(df) -> pd.DataFrame:
+        """
+        Renames columns to fit the export format.
+
+        Returns the modified dataframe.
+        """
         # Rename columns
         renames = {
             "observation_id"        : "catalogNumber",
@@ -285,13 +326,15 @@ class Review:
             "coordinate_precision"  : "DISTANCE"
             # keep license and project_license the same
         }
-        df = df.rename(columns=renames)
+        return df.rename(columns=renames)
 
-        df_clean = ExportSchema.validate(df)
-
-        # Reorder columns
+    @staticmethod
+    def _reorder_clean_columns(df) -> pd.DataFrame:
+        """
+        Returns the dataframe with columns in a nicer order.
+        """
         # pylint: disable=duplicate-code
-        df_clean = df_clean[[
+        return df[[
             "catalogNumber",
             "UniqueSurveyID",
             "v_date",
@@ -338,12 +381,43 @@ class Review:
             "expert_verified"
         ]]
 
-        df_clean.to_csv(file_path, index=False)
+
+    def format_for_export(self):
+        """
+        Puts the observations dataframe into export format and returns it.
+        """
+        df = self.observations.copy()
+
+        # Convert dates to strings
+        for col in df.select_dtypes(include="datetime").columns:
+            df[col] = df[col].dt.strftime(DATE_FORMAT)
+
+        # Populate v_by
+        df["v_by"] = self._clean_names(df)
+
+        df = self._merge_locations(df)
+
+        # Fill null string fields with empty string
+        for col in df.select_dtypes(include=["object"]).columns:
+            df[col] = df[col].fillna("")
+
+        df = self._add_static_columns(df)
+        df = self._add_evidence_type(df)
+        df = self._rename_columns(df)
+
+        df_clean = ExportSchema.validate(df)
+
+        df_clean = self._reorder_clean_columns(df_clean)
+
         return df_clean
+
+    """
+    ok well the dates are kind of a problem. my export schema assumes that it's exporting to csv, so it has dates as string type. but GDBs have an actual date type. in format_for_export i convert datetime types to strings. i guess i just take that line out and change the schema types to datetimes?
+    """
 
 
     @staticmethod
-    def clean_names(df: pd.DataFrame):
+    def _clean_names(df: pd.DataFrame):
         """
         Create a series that uses the user's name if present and their 
         their username if not.
