@@ -20,7 +20,7 @@ The code was adapted from the [iNatScraper repository](https://github.com/clark-
       
       Name the first variable ```INAT_APP_ID``` and set its value to your iNaturalist app ID. Name the second variable ```INAT_APP_SECRET``` and set its value to your iNaturalist app secret.
 
-2. **Download or clone this repository**. Either clone the repository to your local machine using the command ```git clone https://github.com/spencer1202/iNaturalistDataPipelineORBIC.git```, or download the entire repository as a ZIP file and extract it onto your computer.
+2. **Download or clone this repository**. Either clone the repository to your local machine using the command ```git clone https://github.com/spencer1202/NHPiNaturalistToolbox.git```, or download the entire repository as a ZIP file and extract it onto your computer.
 
 3. **Register iNaturalist account in credential manager**. In order to download the unobscured locations for observations that trust your account, the tool needs access to your iNaturalist credentials. For security purposes, those credentials must be stored in the Windows Credential Manager. Follow these instructions:
    * In the Start menu, search for “credential manager” and open it.
