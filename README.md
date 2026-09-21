@@ -13,7 +13,7 @@ The code was adapted from the [iNatScraper repository](https://github.com/clark-
 1. **Register for an iNaturalist app**. This is probably the most involved step, but it only needs to be done once, whereas the other steps may need to be repeated to get set up on different computers. Find out about becoming an app owner at this link: [iNaturalist Applications](https://www.inaturalist.org/oauth/applications). The callback URL is not important for this tool, so you can set it to https://localhost:8080 or some other arbitrary URL. Once you have your app ID and app secret, continue to the next step.
 
 2. **Set environment variables**. Add your app ID and app secret as environment variables using the system control panel.
-   * In the Start menu, search "edit the system environment variables" and select the result. Click "Environment Variables" at the bottom of the window.
+   * In the Start menu, search "edit the environment variables for your account" and select the result.
    * Create two new user environment variables. To create a variable, click the "New" button located under the list of user variables.
 
       ![Windows Environment Variables editor](docs/env_variables.png)
@@ -47,11 +47,13 @@ The code was adapted from the [iNatScraper repository](https://github.com/clark-
 
 This pipeline is designed to be interacted with through an ArcGIS Pro Python Toolbox. It contains three tools which should be run roughly in sequence: Build Taxon Mapping, Download iNat Observations, and Perform Review of Observations. When run in order, these tools create a GeoPackage database containing all tracking list and iNaturalist observation data, then output a CSV file with a list of reviewed observations. More details on what these tables look like can be found in the [Methodology](#methodology) section.
 
+It's recommended that after you run the taxon mapping tool, you should go through and manually verify the mappings before running the download tool. A good starting point is to filter for mappings where the Biotics name is different from the iNaturalist name. If any of the mappings are incorrect, you can go into the tracking_rel table in ArcGIS Pro and delete the corresponding row. The database will automatically clean up any orphaned iNaturalist taxon rows. Just be aware that if you run the mapping tool again, that incorrect mapping will be reinserted.
+
 The tool will output run information in the Messages tab. For more detailed logs and debug information, check for a log file in the [logs](/logs) folder.
 
 **The three tools have these parameters in common:**
 * **Geopackage database file**. A GeoPackage (.gpkg) database file. This can be an existing file selected through the file browser, or you can manually edit the file path to create a new file. 
-* **iNaturalist username**. This tells the tool what credentials to request from the system credential manager. An iNaturalist login is required from 
+* **iNaturalist username**. This tells the tool what credentials to request from the system credential manager.
 
 
 ### Build Taxon Mapping
@@ -95,45 +97,48 @@ When running for the first time, there will likely be a very large quantity of o
 
 ### Perform Review of Observations
 **Additional parameters:**
-* **iNaturalist project ID**: Project members have agreed to provide a license to use their observations with attribution, so the review requires a list of project members. This parameter specifies which project to download members from.
+* **Update project members and annotations from iNaturalist?**: Whether or not the tool should fetch the list of project members and the possible iNaturalist annotation values from the iNaturalist API. If checked, both the iNaturalist project ID and an iNaturalist username are required. If left unchecked, those two parameters are not provided.
+* **iNaturalist project ID** *(Optional)*: Project members have agreed to provide a license to use their observations with attribution, so the review requires a list of project members. This parameter specifies which project to download members from.
 * **Experts file**: A list of trusted experts with their iNaturalist user IDs and their taxonomic expertise.
 * **Experts file iNaturalist ID field**: The field from the experts file that contains iNaturalist user IDs.
 * **Experts file expertise field**: The field from the experts file that contains the taxonomic expertise pattern.
-* **Export CSV**: A filepath for the reviewed output CSV.
+* **Output format**: Whether the reviewed observations should be exported as a CSV or a GeoDatabase Feature Class.
+* **Export CSV** *(Optional)*: A filepath for the reviewed output CSV.
+* **Export feature class** *(Optional)*: The name of the output feature class to be created.
 
-This tool reviews the downloaded observations for expert agreement, evaluates licenses, reformats fields effected by geoprivacy settings, and exports the resulting table as a CSV. 
+This tool reviews the downloaded observations for expert agreement, evaluates licenses, reformats fields effected by geoprivacy settings, and exports the resulting table as a CSV or a feature class. 
 
 **Notes on conversion to GDB**
 The iNaturalist API uses the GeoJSON standard to encode coordinate information, which specifies WGS84 as the coordinate system ([Wikipedia](https://en.wikipedia.org/wiki/GeoJSON#Geometries)).
 
 
-
 ## Methodology
 This section provides more detailed information on the steps each tool performs.
 ### Building the taxon mapping
-The tool builds the taxon mapping by following these steps:
-1. Load and validate the tracking list and name overrides files. Both files must follow the format specified in the [Usage](#build-taxon-mapping) section or this step will fail.
-2. Prepare the tracking list by applying name overrides, preprocessing scientific names, and marking undescribed taxa. More information on these steps is provided below. 
-3. Insert the cleaned tracking list into the GeoPackage database. 
-4. Load any existing mappings from the database and filter these out of the list of taxa to search for. 
-5. Walk through each taxon in the tracking list and search the iNaturalist taxa API using the preprocessed scientific name, or the override name when present, or bypassing the name entirely to search by taxon ID when one is provided in the overrides list. The API may return zero, one, or many results, sorted by number of observations. If there is a result whose scientific name is an exact match, the tool uses that one. Otherwise it chooses the first result. Undescribed taxa are searched for using their more generic name, and each generic name is only searched for once.
-6. Inserts the new mappings into the database.
+The tool builds the taxon mapping following these steps:
+1. Load any existing mappings from the database.
+2. Load and validate the tracking list and name overrides files. Both files must follow the format specified in the [Usage](#build-taxon-mapping) section or this step will fail.
+3. Prepare the tracking list by mapping name overrides, preprocessing scientific names, marking undescribed taxa, and filling in missing parent taxon IDs. More information on these steps is provided below.
+4. Filter out taxa that have already been mapped.
+5. Walk through each taxon in the tracking list and search the iNaturalist taxa API using the preprocessed scientific name, or the override name when present, or bypassing the name entirely to search by taxon ID when one is provided in the overrides list. Start the search at the taxon's own taxonomic classification level, then search the taxon's higher levels until either a result is found, or the search at the genus level returns no results. If the API returns any results, select a match only if its name or one of its synonyms exactly matches the search term.
+6. Validate that the resulting mappings are in the expected format.
+7. Insert the cleaned tracking list and the new mappings into the GeoPackage database. 
 
 **Name overrides**
 Most of the time you'll only have the override names, in which case the taxon_id column may be all blank. But if iNaturalist's search function is being particularly stubborn, you can include the exact ID of the iNaturalist taxon that matches the Biotics one. The tool will ignore the scientific names entirely and search directly by taxon ID. It still searches for these taxa to verify that the IDs actually exists.
 
 **Preprocessing scientific names**
-When searching iNaturalist to build the mapping between Biotics and iNaturalist taxa, scientific names from Biotics need to be converted into the trinomial format that iNaturalist prefers. This means removing the abbreviations var., pop., and ssp., as well as substituting undescribed taxon names with the their higher taxonomic classification and inserting name overrides. The name used in the search is included in the ```tracking_taxa``` database table and in the output file as ```search_name```. 
+When searching iNaturalist to build the mapping between Biotics and iNaturalist taxa, scientific names from Biotics need to be converted into the trinomial format that iNaturalist prefers. This means removing the abbreviations var., pop., and ssp.
 
 **Undescribed taxa**
-Undescribed species, subspecies, and populations all have a number in their scientific name in Biotics. Since these undescribed taxa are what's actually being tracked and not their broader taxonomic group, these taxa are marked in the database as undescribed and excluded from downloading. However, since it's still useful to map these undescribed taxa to the closest equivalent taxon in iNaturalist, the tool takes the scientific name without the number, stores it in the ```search_name``` field, and includes the generic name in the search.
+Undescribed species, subspecies, and populations all have a number in their scientific name in Biotics. Since these undescribed taxa are what's actually being tracked and not their broader taxonomic group, these taxa are marked in the database as undescribed and their parent taxon is used for mapping.
 
 Currently, there are still rare cases where iNaturalist's taxon search is way off base. There are also synonyms to worry about that iNaturalist might not catch. Name and taxon ID overrides are the workaround.
 
 ### Downloading observations
-The tool downloads observations by following these steps:
+The tool downloads observations following these steps:
 1. Retrieve taxon mappings from the database.
-2. Filter out undescribed taxa and taxa that have been updated less than the specified number of days ago.
+2. Filter out taxa with parent/genus based mappings and taxa that have been updated less than the specified number of days ago.
 3. Download observations using the filters given by the parameters. Taxa are searched for in batches.
 4. Structure the API responses. Observations are returned as JSON-encoded records that need to be unpacked and structured into their component observation, identifications, users, and annotations.
 5. Validates the results and inserts them into the observations, identifications, users, and annotations tables.
@@ -168,20 +173,22 @@ This table represents the Biotics tracking list. Most of the fields are directly
 | Field | Data Type | Description |
 |-------|-----------|-------------|
 | est_id | integer | Element subnational ID from Biotics. |
-| sci_name | string | Taxon's scientific name, verbatim from the tracking list. |
-| search_name | string | A clean version of the taxon's scientific name (see [Building the taxon mapping](#building-the-taxon-mapping)). |
+| egt_id | integer | Element global tracking ID from Biotics. Used to fill in missing parent global tracking IDs |
+| sci_name | string | Taxon's scientific name, verbatim from the Biotics tracking list. |
+| global_sci_name | string | Taxon's Biotics global tracking element name. Used to fill in missing parent scientific names. |
+| override_name | string | Taxon's manually mapped iNaturalist name. |
+| classification_level | string | Taxon's taxonomic level (i.e. species, subspecies, variety, population). |
 | is_described | boolean | Whether the taxon is described. This is false for taxa that have a number in their scientific name (see [Undescribed taxa](#undescribed-taxa)). |
+| parent_egt_id | integer | The element global tracking ID of this taxon's parent species. Only populated for taxa that have a parent species (subspecies, varieties, and populations). |
 | element_type | string | A Biotics categorization that places taxa into either "Plant" (which includes fungi) or "Animal". Field is empty for chromists. |
-| scientific_name | string | Scientific name surrounded by HTML italics tags: \<i>\</i>. |
 | common_name | string | Taxon's common name from Biotics. |
-| element_name | string | Element subnational ID as a string. |
 | family | string | Taxon's family name. |
+| genus_egt_id | integer | The element global tracking ID of this taxon's genus. |
 | author | string | Taxon's author citation. |
 | egt_uid | string | Another ID used by Biotics. |
 | srank | string | Taxon's subnational rank. |
 | track_status | string | Taxon's tracking status in Biotics, e.g. "Track all extant and selected historical EOs". |
 | explorer | string | Link to the taxon's NatureServe explorer page. |
-| explorer_link | string | Explorer link formatted using HTML \<a href=""> tag. |
 | elcode | string | Taxon's Biotics ELCODE. |
 | growth_habit | string | The growth habit for plants and fungi. Field may be empty. |
 | duration | string | The life history strategy of plants (e.g. annual vs. perennial) and fungi. Field may be empty. |

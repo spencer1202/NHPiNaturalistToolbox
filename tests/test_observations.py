@@ -36,16 +36,16 @@ def taxa_df():
     return make_taxa_df(
         [1, 2, 3, 4],
         ["2026-01-01", "2026-01-01", "2026-01-01", None],
-        is_described=[1, 1, 0, 1],
+        match_type=["exact", "exact", "parent", "exact"],
     )
 
 @pytest.fixture
 def described_taxa_df():
-    """Taxa dataframe with a mix of described/undescribed taxa, for filter_taxa tests."""
+    """Taxa dataframe with a mix of match types, for filter_taxa tests."""
     return make_taxa_df(
         [1, 2, 3, 4],
         ["2026-01-01", "2026-01-01", "2026-01-01", None],
-        is_described=[1, 1, 0, 1],
+        match_type=["exact", "exact", "parent", "exact"],
     )
 
 @pytest.fixture
@@ -163,27 +163,32 @@ def annotations_df():
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def make_taxa_df(taxon_ids: list, date_updated: list, is_described: list = None) -> pd.DataFrame:
+def make_taxa_df(taxon_ids: list, date_updated: list, match_type: list = None) -> pd.DataFrame:
     """
-    Factory for a full-schema mappings dataframe. Non-essential columns are filled with 
-    placeholder values derived from each taxon_id. is_described defaults to described (1) for 
-    every row unless overridden.
+    Factory for a full-schema mappings dataframe. Non-essential columns are filled with
+    placeholder values derived from each taxon_id. match_type defaults to 'exact' for every row
+    unless overridden.
     """
-    if is_described is None:
-        is_described = [
-            int(bool(value))
-            for value in [True] * len(taxon_ids)
-        ]
+    if match_type is None:
+        match_type = ["exact"] * len(taxon_ids)
     return pd.DataFrame({
-        "est_id":        [200 + tid for tid in taxon_ids],
-        "elcode":        [f"AAAA{tid:04d}" for tid in taxon_ids],
-        "sci_name":      [f"Taxon {tid} sci" for tid in taxon_ids],
-        "search_name":   [f"Taxon {tid} sci" for tid in taxon_ids],
-        "is_described":  is_described,
-        "common_name":   [f"Taxon {tid}" for tid in taxon_ids],
-        "taxon_id":      taxon_ids,
-        "inat_name":     [f"Taxon {tid} sci" for tid in taxon_ids],
-        "date_updated":  date_updated,
+        "est_id":               [200 + tid for tid in taxon_ids],
+        "egt_id":                [300 + tid for tid in taxon_ids],
+        "elcode":                [f"AAAA{tid:04d}" for tid in taxon_ids],
+        "sci_name":              [f"Taxon {tid} sci" for tid in taxon_ids],
+        "override_name":         [None for _ in taxon_ids],
+        "parent_egt_id":         [None for _ in taxon_ids],
+        "parent_sci_name":       [None for _ in taxon_ids],
+        "genus_egt_id":          [None for _ in taxon_ids],
+        "genus_sci_name":        [None for _ in taxon_ids],
+        "common_name":           [f"Taxon {tid}" for tid in taxon_ids],
+        "classification_level":  ["Species" for _ in taxon_ids],
+        "is_described":          [True for _ in taxon_ids],
+        "match_element_id":      [200 + tid for tid in taxon_ids],
+        "taxon_id":              taxon_ids,
+        "inat_name":             [f"Taxon {tid} sci" for tid in taxon_ids],
+        "date_updated":          date_updated,
+        "match_type":            match_type,
     })
 
 def make_observation(obs_id: int, user_id: int = 42) -> dict:
@@ -328,15 +333,31 @@ class TestApplyDateFilter:
 
 
 class TestFilterTaxa:
-    def test_filters_out_undescribed_taxa(self, downloader, described_taxa_df):
-        result = downloader.filter_taxa(described_taxa_df)
-        assert 3 not in result["taxon_id"].values
+    def test_filters_out_parent_matches(self, downloader):
+        df = make_taxa_df([1, 2], ["2026-01-01", "2026-01-01"], match_type=["exact", "parent"])
+        result = downloader.filter_taxa(df)
+        assert 2 not in result["taxon_id"].values
+        assert 1 in result["taxon_id"].values
+
+    def test_filters_out_genus_matches(self, downloader):
+        df = make_taxa_df([1, 2], ["2026-01-01", "2026-01-01"], match_type=["exact", "genus"])
+        result = downloader.filter_taxa(df)
+        assert 2 not in result["taxon_id"].values
+        assert 1 in result["taxon_id"].values
+
+    def test_keeps_override_matches(self, downloader):
+        df = make_taxa_df([1, 2], ["2026-01-01", "2026-01-01"], match_type=["exact", "override"])
+        result = downloader.filter_taxa(df)
+        assert 1 in result["taxon_id"].values
+        assert 2 in result["taxon_id"].values
 
     def test_sets_total_taxa_count(self, downloader, described_taxa_df):
         downloader.filter_taxa(described_taxa_df)
         assert downloader.total_taxa_count == len(described_taxa_df)
 
     def test_sets_undescribed_taxa_count(self, downloader, described_taxa_df):
+        """undescribed_taxa_count now tracks non-exact/override (parent/genus) matches,
+        not literal undescribed status - the fixture has one 'parent' match type row."""
         downloader.filter_taxa(described_taxa_df)
         assert downloader.undescribed_taxa_count == 1
 
@@ -356,7 +377,7 @@ class TestFilterTaxa:
                 str(dt.date.today() - dt.timedelta(days=1)),   # too recent, filtered out
                 str(dt.date.today() - dt.timedelta(days=30)),  # stale enough, kept
             ],
-            is_described=[1, 1],
+            match_type=["exact", "exact"],
         )
         result = downloader.filter_taxa(df)
         assert 1 not in result["taxon_id"].values
@@ -551,7 +572,7 @@ class TestUnpackAnnotations:
 class TestUnpackResults:
     def test_adds_observation(self, observation_data):
         results = ObservationResults()
-        ObservationDownloader._unpack_results([observation_data], results, set())
+        ObservationDownloader._unpack_results([observation_data], results, set(), set())
         assert len(results.observations) == 1
         assert results.observations[0]["observation_id"] == 1001
 
@@ -559,32 +580,36 @@ class TestUnpackResults:
         """Catches the bug where return inside the for loop exits after the first result."""
         data = [make_observation(1001, user_id=1), make_observation(1002, user_id=2)]
         results = ObservationResults()
-        ObservationDownloader._unpack_results(data, results, set())
+        ObservationDownloader._unpack_results(data, results, set(), set())
         assert len(results.observations) == 2
 
-    def test_returns_updated_users_set(self, observation_data):
+    def test_returns_updated_users_and_observation_id_sets(self, observation_data):
         results = ObservationResults()
         users_set = set()
-        returned_set = ObservationDownloader._unpack_results([observation_data], results, users_set)
-        assert 1 in returned_set
+        id_set = set()
+        returned_users_set, returned_id_set = (
+            ObservationDownloader._unpack_results([observation_data], results, users_set, id_set)
+        )
+        assert 1 in returned_users_set
+        assert 1001 in returned_id_set
 
     def test_adds_observer_to_users(self, observation_data):
         results = ObservationResults()
         users_set = set()
-        users_set = ObservationDownloader._unpack_results([observation_data], results, users_set)
+        users_set, _ = ObservationDownloader._unpack_results([observation_data], results, users_set, set())
         assert 1 in users_set
         assert any(u["id"] == 1 for u in results.users)
 
     def test_does_not_duplicate_observer(self, observation_data):
         results = ObservationResults()
         users_set = {42}
-        ObservationDownloader._unpack_results([observation_data], results, users_set)
+        ObservationDownloader._unpack_results([observation_data], results, users_set, set())
         assert not any(u["id"] == 42 for u in results.users)
 
     def test_adds_identifications(self, observation_data, identification_data):
         observation_data["identifications"] = [identification_data]
         results = ObservationResults()
-        ObservationDownloader._unpack_results([observation_data], results, set())
+        ObservationDownloader._unpack_results([observation_data], results, set(), set())
         assert len(results.identifications) == 1
 
     def test_adds_annotations(self, observation_data):
@@ -592,14 +617,15 @@ class TestUnpackResults:
             {"controlled_attribute_id": 1, "controlled_value_id": 2, "user_id": 1, "vote_score": 1}
         ]
         results = ObservationResults()
-        ObservationDownloader._unpack_results([observation_data], results, set())
+        ObservationDownloader._unpack_results([observation_data], results, set(), set())
         assert len(results.annotations) == 1
 
     def test_skips_annotations_when_empty(self, observation_data):
         results = ObservationResults()
-        ObservationDownloader._unpack_results([observation_data], results, set())
+        ObservationDownloader._unpack_results([observation_data], results, set(), set())
         assert results.annotations == []
 
+    # TODO add tests for handling duplicate observations
 
 # ---------------------------------------------------------------------------
 # fetch_observations

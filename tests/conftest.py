@@ -1,7 +1,6 @@
 from unittest.mock import MagicMock, patch
 import pytest
 import logging
-import pickle as pkl
 import pandas as pd
 
 from inatdatapipeline.client import (
@@ -15,7 +14,7 @@ from inatdatapipeline.schemas.validation import (
     IdentificationsSchema,
     ExpertsSchema
 )
-from inatdatapipeline.db import DBManager
+from inatdatapipeline.database.db import DBManager
 from inatdatapipeline.client.authentication import INaturalistAuth
 from inatdatapipeline.client import review
 

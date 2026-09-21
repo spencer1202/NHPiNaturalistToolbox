@@ -257,7 +257,7 @@ def test_format_for_export_uses_private_coordinates_when_available(observations_
     reviewer = review.Reviewer(observations_df)
     reviewer.run_review(expert_ids_df, annotations_df, project_members)
 
-    export_df = reviewer.format_for_export()
+    export_df = reviewer._format_for_export()
     row = export_df.loc[export_df["catalogNumber"] == 103].iloc[0]
 
     assert row["latitude"] == pytest.approx(44.2335)
@@ -282,12 +282,12 @@ def test_clean_names_prefers_public_name_to_login():
 # format_for_export
 # ---------------------------------------------------------------------------
 
-def test_format_for_export_returns_valid_export_rows(observations_df, expert_ids_df, annotations_df):
+def test_format_for_csv_returns_valid_export_rows(observations_df, expert_ids_df, annotations_df):
     project_members = {2}
     reviewer = review.Reviewer(observations_df)
     reviewer.run_review(expert_ids_df, annotations_df, project_members)
 
-    export_df = reviewer.format_for_export()
+    export_df = reviewer.format_for_csv()
 
     assert list(export_df.columns[:10]) == [
         "catalogNumber",

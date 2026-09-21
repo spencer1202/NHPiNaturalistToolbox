@@ -126,7 +126,7 @@ class ObservationsConfig(BaseModel):
     per_page            : int
     batch_size          : int
     update_after_days   : int
-    project_id          : int
+    project_id          : Optional[int]
     max_observations    : int
 
 
@@ -140,7 +140,8 @@ class ReviewConfig(BaseModel):
     experts_file            : RequiredExistingCSV
     experts_id_field        : str
     experts_expertise_field : str
-    export_csv              : RequiredNewCSV
+    export_format           : str
+    export_path             : str
 
 
 T = TypeVar('T', bound=BaseModel)

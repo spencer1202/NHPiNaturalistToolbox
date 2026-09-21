@@ -9,6 +9,8 @@ import datetime as dt
 import re
 import os
 import pandas as pd
+import numpy as np
+from pandas.api.typing import NAType
 import arcpy
 from inatdatapipeline.client import (
     observations,
@@ -17,6 +19,9 @@ from inatdatapipeline.client import (
 
 sqlite3.register_adapter(dt.date, lambda d: d.isoformat())
 sqlite3.register_adapter("date", lambda b: dt.date.fromisoformat(b.decode()))
+sqlite3.register_adapter(NAType, lambda _: None)
+sqlite3.register_adapter(np.int64, int)
+sqlite3.register_adapter(np.int32, int)
 
 logger = logging.getLogger("pipeline")
 
@@ -124,79 +129,124 @@ class DBManager:
             tracking_df: A dataframe with the tracking list. Should conform to the 
             TrackingSchemaClean model, including the search_name and is_described columns.
         """
+        self.check_connection()
         if tracking_df is None or len(tracking_df) == 0:
             return -1
 
-        statement =  """
-            INSERT INTO tracking_taxa (
-                sci_name,
-                search_name,
-                is_described,
-                est_id, 
-                element_type,
-                scientific_name, 
-                common_name,
-                element_name,
-                family,
-                author,
-                egt_uid,
-                srank,
-                track_status,
-                explorer,
-                explorer_link,
-                elcode, 
-                growth_habit,
-                duration
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(est_id) 
-            DO UPDATE SET
-                sci_name = excluded.sci_name, 
-                search_name = excluded.search_name,
-                is_described = excluded.is_described,
-                element_type = excluded.element_type,
-                scientific_name = excluded.scientific_name,
-                common_name = excluded.common_name,
-                element_name = excluded.element_name,
-                family = excluded.family,
-                author = excluded.author,
-                egt_uid = excluded.egt_uid,
-                srank = excluded.srank,
-                track_status = excluded.track_status,
-                explorer = excluded.explorer,
-                explorer_link = excluded.explorer_link,
-                elcode = excluded.elcode,
-                growth_habit = excluded.growth_habit,
-                duration = excluded.duration
+        statements =  [
             """
+                INSERT INTO tracking_taxa (
+                    est_id, 
+                    egt_id,
+                    sci_name,
+                    global_sci_name,
+                    override_name,
+                    classification_level,
+                    is_described,
+                    parent_egt_id,
+                    element_type,
+                    common_name,
+                    family,
+                    genus_egt_id,
+                    author,
+                    egt_uid,
+                    srank,
+                    track_status,
+                    explorer,
+                    elcode, 
+                    growth_habit,
+                    duration
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(est_id) 
+                DO UPDATE SET
+                    egt_id = excluded.egt_id,
+                    sci_name = excluded.sci_name,
+                    global_sci_name = excluded.global_sci_name,
+                    override_name = excluded.override_name,
+                    classification_level = excluded.classification_level,
+                    is_described = excluded.is_described,
+                    parent_egt_id = excluded.parent_egt_id,
+                    element_type = excluded.element_type,
+                    common_name = excluded.common_name,
+                    family = excluded.family,
+                    genus_egt_id = excluded.genus_egt_id,
+                    author = excluded.author,
+                    egt_uid = excluded.egt_uid,
+                    srank = excluded.srank,
+                    track_status = excluded.track_status,
+                    explorer = excluded.explorer,
+                    elcode = excluded.elcode,
+                    growth_habit = excluded.growth_habit,
+                    duration = excluded.duration
+            """,
+            """
+                INSERT INTO parent_taxa (
+                    parent_egt_id,
+                    parent_sci_name
+                )
+                VALUES (?, ?)
+                ON CONFLICT(parent_egt_id) 
+                DO UPDATE SET
+                    parent_sci_name = excluded.parent_sci_name
+            """,
+            """
+                INSERT INTO genera (
+                    genus_egt_id,
+                    genus_sci_name
+                )
+                VALUES (?, ?)
+                ON CONFLICT (genus_egt_id)
+                DO UPDATE SET
+                    genus_sci_name = excluded.genus_sci_name
+            """
+        ]
 
         tracking_cols = [
-            "sci_name", 
-            "search_name",
-            "is_described",
             "est_id",
+            "egt_id",
+            "sci_name", 
+            "global_sci_name",
+            "override_name",
+            "classification_level",
+            "is_described",
+            "parent_egt_id",
             "element_type", 
-            "scientific_name", 
             "common_name", 
-            "element_name",
             "family",
+            "genus_egt_id",
             "author",
             "egt_uid",
             "srank",
             "track_status",
             "explorer",
-            "explorer_link",
             "elcode",
             "growth_habit",
             "duration"
         ]
+        parent_cols = [
+            "parent_egt_id",
+            "parent_sci_name"
+        ]
+        genus_cols = [
+            "genus_egt_id",
+            "genus_sci_name",
+        ]
 
         with closing(self._conn.cursor()) as cursor:
             cursor.executemany(
-                statement,
+                statements[0],
                 list(tracking_df[tracking_cols].itertuples(index=False))
             )
             count = cursor.rowcount
+            cursor.executemany(
+                statements[1],
+                list(tracking_df[parent_cols].dropna().itertuples(index=False))
+            )
+            cursor.executemany(
+                statements[2],
+                list(tracking_df[genus_cols].itertuples(index=False))
+            )
 
         return count
 
@@ -210,15 +260,18 @@ class DBManager:
 
         statements = [
             """
-            INSERT OR IGNORE INTO inat_taxa (taxon_id, inat_name)
+            INSERT INTO inat_taxa (taxon_id, inat_name)
             VALUES (?, ?)
             ON CONFLICT(taxon_id) 
             DO UPDATE SET 
                 inat_name = excluded.inat_name;
             """,
             """
-            INSERT OR IGNORE INTO tracking_rel (taxon_id, est_id)
-            VALUES (?, ?);
+            INSERT INTO tracking_rel (taxon_id, est_id, parent_egt_id, genus_egt_id)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(est_id) DO UPDATE SET taxon_id = excluded.taxon_id
+            ON CONFLICT(parent_egt_id) DO UPDATE SET taxon_id = excluded.taxon_id
+            ON CONFLICT(genus_egt_id) DO UPDATE SET taxon_id = excluded.taxon_id
             """
         ]
 
@@ -229,38 +282,11 @@ class DBManager:
             )
             cursor.executemany(
                 statements[1],
-                list(mapping_df[["taxon_id", "est_id"]].itertuples(index=False))
+                list(mapping_df[["taxon_id", "est_id", "parent_egt_id", "genus_egt_id"]].itertuples(index=False))
             )
             count = cursor.rowcount
 
         return count
-
-
-    def insert_alternatives(self, alternatives_df: pd.DataFrame) -> int:
-        """
-        Inserts name alternatives into the inat_taxa_alternatives table. Returns number of rows
-        inserted, or 0 if the dataframe is empty.
-        """
-        if alternatives_df is None or len(alternatives_df) == 0:
-            return 0
-
-        statement = """
-            INSERT OR IGNORE INTO inat_taxa_alternatives (
-                taxon_id,
-                alternative_taxon_id,
-                alternative_inat_name
-            )
-            VALUES (?, ?, ?)
-            """
-
-        try:
-            with closing(self._conn.cursor()) as cursor:
-                cursor.executemany(statement, list(alternatives_df.itertuples(index=False)))
-                count = cursor.rowcount
-            return count
-
-        except sqlite3.Error as ex:
-            raise sqlite3.Error(f"Error while inserting taxon name alternatives: {ex}")
 
 
     def _select_query(self, query: str) -> pd.DataFrame:

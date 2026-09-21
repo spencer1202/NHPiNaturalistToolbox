@@ -24,19 +24,24 @@ def sliding_page_requests(url: str, params: dict, headers: dict) -> tuple[list, 
     all_results = []
     has_more = True
     iterations = 0
+
+    # Make sure to clear "id_above" parameter
+    params.pop("id_above", None)
+
     while has_more:
         response = requests.get(url, params, headers=headers, timeout=TIMEOUT)
         response.raise_for_status()
 
         data = response.json()
         results = data.get("results", [])
+        iterations += 1
 
         if not results:
             has_more = False
+            time.sleep(1.0)
             break
 
         all_results.extend(results)
-        iterations += 1
 
         last_id = results[-1].get("id")
         logger.debug("\tPage %i fetched. Last ID: %i. Total so far: %i.",

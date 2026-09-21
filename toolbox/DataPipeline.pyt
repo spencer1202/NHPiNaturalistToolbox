@@ -15,8 +15,6 @@ from requests import HTTPError
 import arcpy
 import traceback
 
-from inatdatapipeline.database import db
-
 # Add current directory to system path
 toolbox_dir = Path(__file__).resolve().parent
 if str(toolbox_dir) not in sys.path:
@@ -29,7 +27,7 @@ if str(top_level_dir) not in sys.path:
 print(sys.path)
 
 # Import local package
-import inatdatapipeline as inat
+import inatdatapipeline
 from inatdatapipeline import (
     pipeline,
 )
@@ -37,20 +35,29 @@ from inatdatapipeline.client import (
     authentication,
     observations,
     taxa,
-    review
+    review,
+    helpers
 )
-from inatdatapipeline.schemas import config
+from inatdatapipeline.schemas import (
+    config, 
+    validation
+)
+from inatdatapipeline.database import (
+    db,
+    gdb_export
+)
 
-importlib.reload(inat)
+importlib.reload(inatdatapipeline)
 importlib.reload(authentication)
 importlib.reload(observations)
 importlib.reload(db)
+importlib.reload(gdb_export)
 importlib.reload(pipeline)
 importlib.reload(config)
+importlib.reload(validation)
 importlib.reload(taxa)
 importlib.reload(review)
-
-
+importlib.reload(helpers)
 
 import inatdatapipeline
 
@@ -90,12 +97,17 @@ logger.addHandler(file_handler)
 ##### Helper functions #####
 def get_auth(
         user_agent: str,
-        username: str
-) -> tuple[Optional[db.DBManager], Optional[authentication.INaturalistAuth]]:
+        username: str | None
+) -> Optional[authentication.INaturalistAuth]:
     """
     Set up iNaturalist authentication using provided user agent and username. Catches exceptions 
     and exits with error message if one occurs.
+
+    Returns None if username is None.
     """
+    if not username:
+        return None
+    
     try:
         auth: authentication.INaturalistAuth = authentication.INaturalistAuth(user_agent)
         success = auth.generate_access_token(username)
@@ -211,7 +223,8 @@ class Tool:
         logger.info("*** iNaturalist Data Pipeline Tool  ***")
         logger.info("---------------------------------------")
         logger.info("File database: %s", db_file)
-        logger.info("iNaturalist username: %s", inat_user)
+        if inat_user:
+            logger.info("iNaturalist username: %s", inat_user)
         logger.info("")
 
         self.db_manager = db.DBManager(db_file)
@@ -259,6 +272,9 @@ class TaxonMapping(Tool):
     def execute(self, parameters, messages):
         """Tool source code"""
         super().execute(parameters, messages)
+
+        if self.auth is None:
+            raise ValueError("Failed to authenticate: missing username.")
 
         tracking_csv = parameters[2].valueAsText
         overrides_csv = parameters[3].valueAsText
@@ -324,7 +340,7 @@ class DownloadObservations(Tool):
             displayName="iNaturalist Project ID",
             name="project_id",
             datatype="GPLong",
-            parameterType="Required",
+            parameterType="Optional",
             direction="Input"
         )
         project_id.value = 247148
@@ -338,7 +354,7 @@ class DownloadObservations(Tool):
         )
         max_observations.filter.type = "Range"
         max_observations.filter.list = [0, 1000000]
-        max_observations.value = 1000
+        max_observations.value = 10000
 
         return params + [place_id, quality_grade, update_after_days, project_id, max_observations]
 
@@ -347,10 +363,13 @@ class DownloadObservations(Tool):
         """Tool source code"""
         super().execute(parameters, messages)
 
+        if self.auth is None:
+            raise ValueError("Failed to authenticate: missing username.")
+
         place_id = int(parameters[2].value)
         quality_grade = parameters[3].valueAsText.replace(";", ",")
         update_after_days = int(parameters[4].value)
-        project_id = int(parameters[5].value)
+        project_id = int(parameters[5].value) if parameters[5].value else None
         max_observations = int(parameters[6].value)
 
         cfg_obs = config.ObservationsConfig(
@@ -370,6 +389,7 @@ class DownloadObservations(Tool):
 
 class RunReview(Tool):
     PER_PAGE = 200
+    DEFAULT_PROJECT_ID = 247148
 
     def __init__(self):
         self.label = "Perform Review of Observations"
@@ -379,6 +399,15 @@ class RunReview(Tool):
         """Define the tool parameters"""
         params = super().getParameterInfo()
 
+        update_from_inat = arcpy.Parameter(
+            displayName="Update project members and annotations from iNaturalist?",
+            name="to_update_members",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input"
+        )
+        update_from_inat.value = False
+
         project_id = arcpy.Parameter(
             displayName="iNaturalist Project ID",
             name="project_id",
@@ -386,7 +415,7 @@ class RunReview(Tool):
             parameterType="Required",
             direction="Input"
         )
-        project_id.value = 247148
+        project_id.value = self.DEFAULT_PROJECT_ID
 
         experts_file = arcpy.Parameter(
             displayName="Experts File",
@@ -417,39 +446,96 @@ class RunReview(Tool):
         experts_expertise_field.parameterDependencies = [experts_file.name]
         experts_expertise_field.value = "Expertise LU"
 
-        export_csv = arcpy.Parameter(
-            displayName="Export CSV",
-            name="export_csv",
-            datatype="DEFile",
+        output_format = arcpy.Parameter(
+            displayName="Output format",
+            name="output_format",
+            datatype="GPString",
             parameterType="Required",
+            direction="Input"
+        )
+        output_format.filter.type = "ValueList"
+        output_format.filter.list = [pipeline.EXPORT_FORMAT_FC, pipeline.EXPORT_FORMAT_CSV]
+        output_format.value = pipeline.EXPORT_FORMAT_FC
+
+        export_fc = arcpy.Parameter(
+            displayName="Export feature class",
+            name="out_fc",
+            datatype="DEFeatureClass",
+            parameterType="Optional",
             direction="Output"
         )
 
+        export_csv = arcpy.Parameter(
+            displayName="Export file path",
+            name="export_path",
+            datatype="DEFile",
+            parameterType="Optional",
+            direction="Output"
+        )
+        export_csv.filter.list = ["csv"]
+        
         new_fields = [
+            update_from_inat,
             project_id, 
             experts_file, 
             experts_id_field,
             experts_expertise_field,
+            output_format,
+            export_fc,
             export_csv
         ]
 
         return params + new_fields
 
+    def updateParameters(self, parameters):
+        # Enable/Disable output parameters based on selected format
+        if parameters[7].valueAsText == "Feature Class":
+            parameters[8].enabled = True   # Enable FC output
+            parameters[9].enabled = False  # Disable CSV output
+        else:
+            parameters[8].enabled = False  # Disable FC output
+            parameters[9].enabled = True   # Enable CSV output
+
+        # Don't ask for username and project ID if not updating from iNaturalist
+        if parameters[2].value:
+            parameters[1].enabled = True
+            parameters[3].enabled = True
+        else:
+            parameters[1].enabled = False
+            parameters[1].value = "N/A"
+            parameters[3].enabled = False
+            parameters[3].value = 0
+
+        return
+
     def execute(self, parameters, messages):
+        # Check if username and project ID parameters are needed
+        update_from_inat = parameters[2].value
+        if update_from_inat:
+            project_id = int(parameters[3].value)
+        else:
+            project_id = None
+            parameters[1].value = None
+
         super().execute(parameters, messages)
 
-        project_id = int(parameters[2].value)
-        cfg_rev = config.ReviewConfig(
-            experts_file=parameters[3].valueAsText,
-            experts_id_field=parameters[4].valueAsText,
-            experts_expertise_field=parameters[5].valueAsText,
-            export_csv=parameters[6].valueAsText,
+        if parameters[7].valueAsText == "Feature Class":
+            export_path = parameters[8].valueAsText
+        else:
+            export_path = parameters[9].valueAsText
 
+        cfg_rev = config.ReviewConfig(
+            experts_file=parameters[4].valueAsText,
+            experts_id_field=parameters[5].valueAsText,
+            experts_expertise_field=parameters[6].valueAsText,
+            export_format=parameters[7].valueAsText,
+            export_path=export_path
         )
         
         try:
-            pipeline.update_project_members(project_id, self.db_manager, self.auth)
-            pipeline.update_annotations(self.db_manager, self.auth)
+            if update_from_inat:
+                pipeline.update_project_members(project_id, self.db_manager, self.auth)
+                pipeline.update_annotations(self.db_manager, self.auth)
             pipeline.run_review(cfg_rev, self.db_manager)
         except ValueError as ex:
             _exit_failure(ex)

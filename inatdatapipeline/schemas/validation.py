@@ -31,20 +31,27 @@ logger = logging.getLogger("pipeline")
 # ---------------------------------------------------------------------------
 class TrackingSchemaRaw(pa.DataFrameModel):
     """Format of raw tracking list from CSV file."""
-    name                : int = pa.Field(ge=0)
-    sname               : str
-    author              : str = pa.Field(nullable=True, coerce=True)
-    scomname            : str = pa.Field(nullable=True, coerce=True)
-    s_rank              : str
-    eo_track_status_desc: str
-    explorer            : str
-    egt_uid             : str
-    family              : str
-    ELCODE_BCD          : str
-    NAME_CATEGORY_DESC  : str
-    growth_habit        : str = pa.Field(nullable=True, coerce=True)
-    element_type        : str = pa.Field(nullable=True, coerce=True)
-    duration            : str = pa.Field(nullable=True, coerce=True)
+    est_id                  : int = pa.Field(ge=0)
+    egt_id                  : int = pa.Field(ge=0)
+    sci_name                : str
+    global_sci_name         : str
+    classification_level    : str
+    parent_egt_id           : int = pa.Field(nullable=True, coerce=True)
+    parent_sci_name         : str = pa.Field(nullable=True)
+    element_type            : str = pa.Field(nullable=True, coerce=True)
+    scomname                : str = pa.Field(nullable=True, coerce=True)
+    family                  : str
+    genus_egt_id            : int = pa.Field(coerce=True)
+    genus                   : str
+    author                  : str = pa.Field(nullable=True, coerce=True)
+    egt_uid                 : str
+    s_rank                  : str
+    eo_track_status_desc    : str
+    explorer                : str
+    elcode_bcd              : str
+    name_category_desc      : str
+    growth_habit            : str = pa.Field(nullable=True, coerce=True)
+    duration                : str = pa.Field(nullable=True, coerce=True)
 
     # pylint: disable=too-few-public-methods
     # pylint: disable=missing-class-docstring
@@ -56,22 +63,32 @@ class TrackingSchemaClean(pa.DataFrameModel):
     """Tracking list with added and renamed columns."""
     # Element subnational tracking ID
     est_id          : int = pa.Field(unique=True, ge=0)
+    # Element global tracking ID
+    egt_id          : int = pa.Field(unique=True, ge=0)
     # Scientific name
     sci_name        : str
-    # Name searched for
-    search_name     : Optional[str]
+    # Global tracking element scientific name
+    global_sci_name : str
+    # iNaturalist name override
+    override_name   : Optional[str] = pa.Field(nullable=True)
+    # Taxonomic classification level
+    classification_level    : str
     # Whether the taxa is described
     is_described    : Optional[bool] = pa.Field(coerce=True)
+    # EGT ID of parent species for subspecies/variants/populations
+    parent_egt_id   : int = pa.Field(nullable=True, coerce=True)
+    # Scientific name of parent species for subspecies/variants/populations
+    parent_sci_name : str = pa.Field(nullable=True)
     # Category (e.g. plant, animal, fungi)
     element_type    : str = pa.Field(nullable=True, coerce=True)
-    # Scientific name italicized with <i></i>
-    scientific_name : str
     # Common name
     common_name     : str = pa.Field(nullable=True, coerce=True)
-    # EST ID as a string
-    element_name    : str
     # Taxon's family name
     family          : str
+    # EGT ID of taxon's genus
+    genus_egt_id    : int
+    # Genus name
+    genus_sci_name  : str
     # Taxon author
     author          : str = pa.Field(nullable=True, coerce=True)
     # Internal Biotics tracking ID
@@ -82,14 +99,19 @@ class TrackingSchemaClean(pa.DataFrameModel):
     track_status    : str
     # Link to Oregon explorer entry
     explorer        : str
-    # Explorer entry formatted as HTML ref tag
-    explorer_link   : str
     # ELCODE
     elcode          : str
     # For plants/fungi (herbaceous, moss, fungus)
     growth_habit    : str = pa.Field(nullable=True, coerce=True)
     # For plants/fungi (perenial, annual)
     duration        : str = pa.Field(nullable=True, coerce=True)
+
+    # Scientific name italicized with <i></i>
+    # scientific_name : str
+    # EST ID as a string
+    # element_name    : str
+    # Explorer entry formatted as HTML ref tag
+    # explorer_link   : str
 
     @classmethod
     def from_raw(
@@ -104,34 +126,15 @@ class TrackingSchemaClean(pa.DataFrameModel):
         schema.
         """
         renames = {
-            "name"                  : "est_id",
-            "sname"                 : "sci_name",
             "element_type"          : "element_type",
             "scomname"              : "common_name",
-            "family"                : "family",
-            "author"                : "author",
-            "egt_uid"               : "egt_uid",
             "s_rank"                : "srank",
             "eo_track_status_desc"  : "track_status",
-            "explorer"              : "explorer", 
-            "ELCODE_BCD"            : "elcode",
-            "growth_habit"          : "growth_habit",
-            "duration"              : "duration"
+            "genus"                 : "genus_sci_name",
+            "elcode_bcd"            : "elcode"
         }
 
         clean_df = df.rename(columns=renames)
-
-        clean_df["element_name"] = clean_df["est_id"].astype(str)   # add element name column
-        clean_df = clean_df.drop_duplicates(subset="est_id")        # drop duplicate est_ids
-
-        clean_df["explorer_link"] = (
-            clean_df["explorer"]
-            .apply(lambda x: f"<a href=\"{x}\">View in Explorer</a>")
-        )
-        clean_df["scientific_name"] = (
-            clean_df["sci_name"]
-            .apply(lambda x: f"<i>{x}</i>")
-        )
 
         clean_df = clean_df.replace(r"^\s*$", np.nan, regex=True)   # replace empty strings with NaN
 
@@ -146,20 +149,12 @@ class TaxonMappingSchema(pa.DataFrameModel):
     Schema for a table that maps tracking taxa to iNaturalist taxa retrieved from the iNaturalist
     taxa API.
     """
-    est_id          : pa.typing.Series[int]
     taxon_id        : pa.typing.Series[int]
     inat_name       : pa.typing.Series[str]
+    est_id          : pa.typing.Series[int] = pa.Field(nullable=True, coerce=True)
+    parent_egt_id   : pa.typing.Series[int] = pa.Field(nullable=True, coerce=True)
+    genus_egt_id    : pa.typing.Series[int] = pa.Field(nullable=True, coerce=True)
 
-# ---------------------------------------------------------------------------
-# Alternative names
-# ---------------------------------------------------------------------------
-class AlternativeNamesSchema(pa.DataFrameModel):
-    """
-    Alternative taxon names retrieved from the iNaturalist taxa API.
-    """
-    taxon_id                : pa.typing.Series[int]
-    alternative_taxon_id    : pa.typing.Series[int]
-    alternative_inat_name   : pa.typing.Series[str]
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +299,7 @@ class FullObservationSchema(ObservationSchema, TrackingSchemaClean):
     columns are in the clean format.
     """
     est_id          : pa.typing.Series[int] = pa.Field(unique=False, ge=0)
+    egt_id          : pa.typing.Series[int] = pa.Field(unique=False, ge=0)
     observation_id  : pa.typing.Series[int] = pa.Field(unique=False, ge=0)
     uuid            : pa.typing.Series[str] = pa.Field(unique=False)
     # TODO change to unqiue=True and test
@@ -534,7 +530,7 @@ class ExportSchema(pa.DataFrameModel):
     """
     catalogNumber       : pa.typing.Series[int]     # observation_id
     UniqueSurveyID      : pa.typing.Series[str]     # uuid
-    v_date              : pa.typing.Series[str]     # observed_on w/o timestame
+    v_date              : pa.typing.Series[pa.DateTime]     # observed_on
     visit_date          : pa.typing.Series[str]     # observed_on_string
     v_by                : pa.typing.Series[str]     # name
     v_note              : pa.typing.Series[str]     # description
@@ -568,6 +564,7 @@ class ExportSchema(pa.DataFrameModel):
     date_option         : pa.typing.Series[str]     # "exact"
     detected_ind        : pa.typing.Series[str]     # "Y"
     ownerInstitutionCode: pa.typing.Series[str]     # "iNaturalist"
+    dateIdentified      : pa.typing.Series[pa.DateTime] = pa.Field(nullable=True, coerce=True)
     identifiedBy        : pa.typing.Series[str]
     identificationReferences: pa.typing.Series[str]
     evidence_type       : pa.typing.Series[str]

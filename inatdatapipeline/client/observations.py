@@ -78,6 +78,7 @@ class ObservationDownloader():
     @staticmethod
     def _get_batches(full_list: list, batch_size: int):
         """Helper function to yield successive n-sized chunks from list"""
+        full_list.sort()
         for i in range(0, len(full_list), batch_size):
             yield full_list[i:i + batch_size]
 
@@ -91,8 +92,19 @@ class ObservationDownloader():
         Returns:
             Dictionary that maps a date string to a set of taxon IDs.
         """
-        date_taxon_map: dict = taxa_df.groupby("date_updated")["taxon_id"].apply(set).to_dict()
-        date_taxon_map["None"] = set(taxa_df[taxa_df["date_updated"].isna()]["taxon_id"])
+        df = taxa_df.sort_values(by="taxon_id", ascending=True).copy()
+        date_taxon_map: dict = (
+            df
+            .groupby("date_updated")["taxon_id"]
+            .apply(set)
+            .to_dict()
+        )
+        date_taxon_map["None"] = (
+            set(df
+                .loc[df["date_updated"].isna(), "taxon_id"]
+                .sort_values(ascending=True)
+            )
+        )
         return date_taxon_map
 
     def _request_batch(self, ids: list, params: dict, headers: str) -> list:
@@ -172,11 +184,21 @@ class ObservationDownloader():
             else None
         )
 
+        community_taxon_id = data.get("community_taxon_id")
+        obs_taxon_id = data.get("taxon", {}).get("id")
+        taxon_id = community_taxon_id if community_taxon_id is not None else obs_taxon_id
+
+        if community_taxon_id is None:
+            logger.warning(
+                "Observation %s has no community taxon - falling back to observation taxon %s.",
+                data.get("id"), obs_taxon_id
+            )
+
         observation = {
             "observation_id"                : data.get("id"),
             "uuid"                          : data.get("uuid"),
             "observer_id"                   : data.get("user", {}).get("id"),
-            "taxon_id"                      : data.get("community_taxon_id"),
+            "taxon_id"                      : taxon_id,
             "license"                       : data.get("license_code"),
             "latitude"                      : lat,
             "longitude"                     : long,
@@ -205,7 +227,7 @@ class ObservationDownloader():
     @staticmethod
     def _unpack_identifications(
         observation_id: int,
-        ident_list: list,
+        ident_list: list[dict],
         user_set: set
     ) -> tuple[list, list]:
         """
@@ -233,6 +255,12 @@ class ObservationDownloader():
         users = []
 
         for identification in ident_list:
+            # Identification does not have taxon ID, skip it
+            taxon_id = identification.get("taxon", {}).get("id")
+            if not taxon_id:
+                logger.debug("**Identification with null taxon: %s**", identification)
+                continue
+
             user = identification.get("user", {})
             user_id = user.get("id")
             new_identificaion = {
@@ -240,8 +268,9 @@ class ObservationDownloader():
                 "user_id"           : user_id,
                 "identification_id" : identification.get("id"),
                 "created_at"        : identification.get("created_at"),
-                "taxon_id"          : identification.get("taxon", {}).get("id")
+                "taxon_id"          : taxon_id
             }
+            
             if user_id and user_id not in user_set:
                 user_set.add(user_id)
                 users.append(user)
@@ -271,14 +300,23 @@ class ObservationDownloader():
         return annotations
 
     @staticmethod
-    def _unpack_results(data: list, all_observations: ObservationResults, users_set: set):
+    def _unpack_results(data: list, all_observations: ObservationResults, users_set: set, obs_id_set: set):
         """
         Extract observations, identifications, and users from a list of nested dictionaries
         into the ObservationsResult object. Mutates all_observations and returns the updated 
-        users_set.
+        users_set and obs_id_set.
         """
         users_set = users_set.copy()
+        obs_id_set = obs_id_set.copy()
+
         for result in data:
+            # Check for duplicate observations
+            obs_id = result.get("id")
+            if obs_id in obs_id_set:
+                logger.warning("Encountered duplicate observation ID: %s", obs_id)
+                continue
+            obs_id_set.add(obs_id)
+
             # Add new observation
             observation = ObservationDownloader._unpack_observation(result)
             all_observations.observations.append(observation)
@@ -306,7 +344,7 @@ class ObservationDownloader():
             all_observations.users.extend(new_users)
             all_observations.identifications.extend(identifications)
 
-        return users_set
+        return users_set, obs_id_set
 
 
     def filter_taxa(
@@ -319,15 +357,16 @@ class ObservationDownloader():
         """
         df = taxa_df.copy()
 
-        # Filter out undescribed taxa
-        described_df = df[df["is_described"] == 1]
+        # Filter out parent/genus level matches
+        match_type_mask = df["match_type"].isin(["exact", "override"])
+        match_df = df[match_type_mask]
 
         # Apply date filter
-        filtered_df = self._apply_date_filter(described_df)
+        filtered_df = self._apply_date_filter(match_df)
 
         # Set stats
         self.total_taxa_count = len(taxa_df)
-        self.undescribed_taxa_count = self.total_taxa_count - len(described_df)
+        self.undescribed_taxa_count = self.total_taxa_count - len(match_df)
         self.filtered_taxa_count = len(filtered_df)
 
         return filtered_df
@@ -374,7 +413,12 @@ class ObservationDownloader():
         # Iterate through taxon IDs and run requests
         all_observations    = ObservationResults()
         users_set           = set()
+        obs_id_set          = set()
         max_reached         = False
+
+        logger.debug("Base parameters:")
+        for param, value in base_params.items():
+            logger.debug("  %s: %s", param, value)
 
         for date, ids in date_taxa_map.items():
             logger.debug("")
@@ -383,17 +427,20 @@ class ObservationDownloader():
                 base_params['created_d1'] = date
             else:
                 logger.debug("Processing taxa with no 'created after' date filter")
+                base_params.pop('created_d1', None)
 
             batches = self._get_batches(list(ids), self.config.batch_size)
             for i, batch in enumerate(batches, start=1):
                 logger.debug("* Processing batch #%i with %i taxa...", i, len(batch))
                 data = self._request_batch(
-                    batch, base_params, self.auth.get_auth_headers()
+                    batch, base_params.copy(), self.auth.get_auth_headers()
                 )
                 logger.debug("  Finished downloading %i results.", len(data))
 
                 # Unpack results into all_observations
-                users_set = self._unpack_results(data, all_observations, users_set)
+                users_set, obs_id_set = self._unpack_results(
+                    data, all_observations, users_set, obs_id_set
+                )
 
                 # Update set of completed taxa
                 all_observations.completed_taxa.update(batch)

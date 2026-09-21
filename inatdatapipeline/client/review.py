@@ -369,6 +369,7 @@ class Reviewer:
             "date_option",
             "detected_ind",
             "ownerInstitutionCode",
+            "dateIdentified",
             "identifiedBy",
             "identificationReferences",
             "evidence_type",
@@ -381,20 +382,42 @@ class Reviewer:
             "expert_verified"
         ]]
 
+    def format_for_gdb(self):
+        df = self._format_for_export()
+        df = ExportSchema.validate(df)
+        df = self._reorder_clean_columns(df)
 
-    def format_for_export(self):
+        return df
+
+    def format_for_csv(self):
+        df = self._format_for_export()
+        
+        # Convert dates to strings
+        for col in df.select_dtypes(include="datetime").columns:
+            df[col] = df[col].dt.strftime(DATE_FORMAT)
+
+        df = self._reorder_clean_columns(df)
+
+        return df
+
+
+    def _format_for_export(self):
         """
         Puts the observations dataframe into export format and returns it.
         """
         df = self.observations.copy()
 
-        # Convert dates to strings
-        for col in df.select_dtypes(include="datetime").columns:
-            df[col] = df[col].dt.strftime(DATE_FORMAT)
+        df["element_name"] = df["est_id"].astype(str)   # add element name column
 
-        # Populate v_by
+        df["explorer_link"] = (
+            df["explorer"]
+            .apply(lambda x: f"<a href=\"{x}\">View in Explorer</a>")
+        )
+        df["scientific_name"] = (
+            df["sci_name"]
+            .apply(lambda x: f"<i>{x}</i>")
+        )
         df["v_by"] = self._clean_names(df)
-
         df = self._merge_locations(df)
 
         # Fill null string fields with empty string
@@ -405,15 +428,7 @@ class Reviewer:
         df = self._add_evidence_type(df)
         df = self._rename_columns(df)
 
-        df_clean = ExportSchema.validate(df)
-
-        df_clean = self._reorder_clean_columns(df_clean)
-
-        return df_clean
-
-    """
-    ok well the dates are kind of a problem. my export schema assumes that it's exporting to csv, so it has dates as string type. but GDBs have an actual date type. in format_for_export i convert datetime types to strings. i guess i just take that line out and change the schema types to datetimes?
-    """
+        return df
 
 
     @staticmethod

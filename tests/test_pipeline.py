@@ -2,17 +2,19 @@ from pathlib import Path
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 import sqlite3
+import shutil
 
 import pandas as pd
 import pytest
 
 from inatdatapipeline import pipeline
-from inatdatapipeline.db import DBManager
+from inatdatapipeline.database.db import DBManager
 from inatdatapipeline.client.observations import ObservationResults
-from inatdatapipeline.client import annotations
+from inatdatapipeline.client import annotations, taxa
 from inatdatapipeline.schemas import config, validation
 
 SCHEMA_SQL = Path(__file__).resolve().parents[1] / "inatdatapipeline" / "schema.sql"
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -32,112 +34,105 @@ def db_manager(tmp_path):
 # ---------------------------------------------------------------------------
 # Taxa
 # ---------------------------------------------------------------------------
-class FakeTaxonMappingBuilder:
-    def __init__(self, tracking_df, overrides_df, auth):
-        self.tracking_df = tracking_df
-        self.overrides_df = overrides_df
-        self.auth = auth
+class FakeTaxonMappingBuilder(taxa.TaxonMappingBuilder):
+    """
+    Subclasses the real TaxonMappingBuilder so every part of the real pipeline runs
+    except the actual network call. Only _make_taxon_request is faked, using a small
+    canned "API" keyed by search name (for normal/parent/genus searches) or override id
+    (for override searches).
+    """
+    # search_name -> fake API results, same shape the real API returns
+    FAKE_RESULTS = {
+        "Salix": [{"name": "Salix", "id": 55501, "matched_term": "Salix"}],
+        "Festuca rubra": [{"name": "Festuca rubra", "id": 55502, "matched_term": "Festuca rubra"}],
+        "Nuphar advena": [{"name": "Nuphar advena", "id": 99999, "matched_term": "Nuphar advena"}]
+    }
 
-    @staticmethod
-    def preprocess_tracking_df(tracking_df, overrides_df):
-        df = tracking_df.copy()
-        df["search_name"] = df["sci_name"]
-        df["is_described"] = True
-        return df
+    # override_id -> fake API results
+    FAKE_ID_RESULTS = {
+        12345: [{"name": "Carex stipata", "id": 12345, "matched_term": "Carex stipata"}],
+        67890: [{"name": "Aster amellus", "id": 67890, "matched_term": "Aster amellus"}],
+    }
 
-    @staticmethod
-    def build_override_id_map(overrides_df):
-        if overrides_df is None or overrides_df.empty:
-            return {}
-        return dict(zip(overrides_df["est_id"], overrides_df["taxon_id"]))
-
-    @staticmethod
-    def get_to_match(tracking_df, mapping_df):
-        needed_cols = ["est_id", "sci_name", "search_name", "is_described"]
-        if mapping_df is None or mapping_df.empty:
-            return tracking_df[needed_cols].copy()
-
-        # 103 is already mapped; 101 and 102 are new mappings.
-        mask = ~tracking_df["est_id"].isin(mapping_df["est_id"])
-        return tracking_df.loc[mask, needed_cols].copy()
-
-    @staticmethod
-    def get_new_mappings(auth, to_match, override_map=None):
-        if override_map is None:
-            override_map = {}
-
-        rows = []
-        for _, row in to_match.iterrows():
-            est_id = int(row["est_id"])
-            override_id = override_map.get(est_id)  # optional only; may be None
-
-            # Simulate the real function: if override exists, use it as API search target;
-            # otherwise query by scientific name.
-            taxon_name = row["sci_name"]
-
-            rows.append(
-                {
-                    "est_id": est_id,
-                    "taxon_id": override_id if override_id is not None else 99999,
-                    "inat_name": taxon_name,
-                }
-            )
-
-        return pd.DataFrame(rows), len(rows)
+    def _make_taxon_request(self, search_name, classification_level=None, override_id=None):
+        self.request_count += 1
+        if override_id:
+            return self.FAKE_ID_RESULTS.get(override_id)
+        return self.FAKE_RESULTS.get(search_name)
 
         
 class TestTaxa:
-
     @staticmethod
     def _write_tracking_csv(path: Path):
         pd.DataFrame(
             [
                 {
-                    "name": 101,
-                    "sname": "Carex stipata",
-                    "author": "Muhlenberg ex Willdenow",
+                    "est_id": 101,
+                    "egt_id": 5001,
+                    "sci_name": "Carex stipata",
+                    "global_sci_name": "Carex stipata",
+                    "classification_level": "Species",
+                    "parent_egt_id": None,
+                    "parent_sci_name": None,
+                    "element_type": "Plant",
                     "scomname": "owlfruit sedge",
+                    "family": "Cyperaceae",
+                    "genus_egt_id": 201,
+                    "genus": "Carex",
+                    "author": "Muhlenberg ex Willdenow",
+                    "egt_uid": "EGT-001",
                     "s_rank": "S5",
                     "eo_track_status_desc": "Tracked",
                     "explorer": "https://example.org/explorer/carex-stipata",
-                    "egt_uid": "EGT-001",
-                    "family": "Cyperaceae",
-                    "ELCODE_BCD": "ABNAB",
-                    "NAME_CATEGORY_DESC": "Vascular plant",
+                    "elcode_bcd": "ABNAB",
+                    "name_category_desc": "Vascular plant",
                     "growth_habit": "Sedge",
-                    "element_type": "Plant",
                     "duration": "Perennial",
                 },
                 {
-                    "name": 102,
-                    "sname": "Aster amellus",
-                    "author": "L.",
+                    "est_id": 102,
+                    "egt_id": 5002,
+                    "sci_name": "Aster amellus",
+                    "global_sci_name": "Aster amellus",
+                    "classification_level": "Species",
+                    "parent_egt_id": None,
+                    "parent_sci_name": None,
+                    "element_type": "Plant",
                     "scomname": "European starwort",
+                    "family": "Asteraceae",
+                    "genus_egt_id": 202,
+                    "genus": "Aster",
+                    "author": "L.",
+                    "egt_uid": "EGT-002",
                     "s_rank": "S4",
                     "eo_track_status_desc": "Tracked",
                     "explorer": "https://example.org/explorer/aster-amellus",
-                    "egt_uid": "EGT-002",
-                    "family": "Asteraceae",
-                    "ELCODE_BCD": "ABNAB",
-                    "NAME_CATEGORY_DESC": "Vascular plant",
+                    "elcode_bcd": "ABNAB",
+                    "name_category_desc": "Vascular plant",
                     "growth_habit": "Forb",
-                    "element_type": "Plant",
                     "duration": "Perennial",
                 },
                 {
-                    "name": 103,
-                    "sname": "Nuphar advena",
-                    "author": "Aiton",
+                    "est_id": 103,
+                    "egt_id": 5003,
+                    "sci_name": "Nuphar advena",
+                    "global_sci_name": "Nuphar advena",
+                    "classification_level": "Species",
+                    "parent_egt_id": None,
+                    "parent_sci_name": None,
+                    "element_type": "Plant",
                     "scomname": "spadderdock",
+                    "family": "Nymphaeaceae",
+                    "genus_egt_id": 203,
+                    "genus": "Nuphar",
+                    "author": "Aiton",
+                    "egt_uid": "EGT-003",
                     "s_rank": "S5",
                     "eo_track_status_desc": "Tracked",
                     "explorer": "https://example.org/explorer/nuphar-advena",
-                    "egt_uid": "EGT-003",
-                    "family": "Nymphaeaceae",
-                    "ELCODE_BCD": "ABNAB",
-                    "NAME_CATEGORY_DESC": "Vascular plant",
+                    "elcode_bcd": "ABNAB",
+                    "name_category_desc": "Vascular plant",
                     "growth_habit": "Aquatic",
-                    "element_type": "Plant",
                     "duration": "Perennial",
                 },
             ]
@@ -166,27 +161,10 @@ class TestTaxa:
         tracking_file = tmp_path / "tracking.csv"
         overrides_file = tmp_path / "overrides.csv"
 
-        self._write_tracking_csv(tracking_file)
-        self._write_overrides_csv(overrides_file)
+        shutil.copy(FIXTURES_DIR / "tracking_scenarios.csv", tracking_file)
+        shutil.copy(FIXTURES_DIR / "overrides_scenarios.csv", overrides_file)
 
         auth = MagicMock()
-        
-        with db_manager as conn:
-            conn._conn.execute(
-                """
-                INSERT INTO inat_taxa (taxon_id, inat_name)
-                VALUES (?, ?)
-                """,
-                (99999, "Nuphar advena"),
-            )
-            conn._conn.execute(
-                """
-                INSERT INTO tracking_rel (est_id, taxon_id)
-                VALUES (?, ?)
-                """,
-                (103, 99999),
-            )
-            conn._conn.commit()
 
         with patch.object(pipeline.taxa, "TaxonMappingBuilder", FakeTaxonMappingBuilder):
             pipeline.build_taxon_mapping(
@@ -200,20 +178,29 @@ class TestTaxa:
         with db_manager as conn:
             tracking_rows = conn.select("tracking_taxa")
             rel_rows = conn.select("tracking_rel")
-            inat_rows = conn.select("inat_taxa")
 
-        assert len(tracking_rows) == 3
-        assert set(tracking_rows["est_id"]) == {101, 102, 103}
+        assert len(tracking_rows) == 6
+        assert set(tracking_rows["est_id"]) == {101, 102, 103, 104, 105, 106}
 
-        rel_by_est = rel_rows.set_index("est_id")["taxon_id"].to_dict()
-        assert rel_by_est[101] == 12345
-        assert rel_by_est[102] == 67890
-        assert rel_by_est[103] == 99999
+        rel_by_est = rel_rows.set_index("est_id")["taxon_id"].dropna().to_dict() if "est_id" in rel_rows else {}
 
-        inat_names = set(inat_rows["inat_name"])
-        assert "Carex stipata" in inat_names
-        assert "Aster amellus" in inat_names
-        assert "Nuphar advena" in inat_names
+        # 101/102: override-driven matches
+        est_rel = rel_rows.dropna(subset=["est_id"]).set_index("est_id")["taxon_id"].to_dict()
+        assert est_rel[101] == 12345
+        assert est_rel[102] == 67890
+
+        # 104: undescribed species, matched via genus fallback
+        genus_rel = rel_rows.dropna(subset=["genus_egt_id"]).set_index("genus_egt_id")["taxon_id"].to_dict()
+        assert genus_rel[204] == 55501
+
+        # 105: undescribed subspecies, matched via parent fallback
+        parent_rel = rel_rows.dropna(subset=["parent_egt_id"]).set_index("parent_egt_id")["taxon_id"].to_dict()
+        assert parent_rel[5005] == 55502
+
+        # 106: described, no match anywhere - no tracking_rel row references it at all
+        assert 106 not in est_rel
+        assert 5006 not in parent_rel
+        assert 206 not in genus_rel
 
 
 
@@ -416,153 +403,120 @@ def cfg_obs():
     )
 
 
-
-class FakeDownloader:
-    def __init__(self, cfg, auth):
-        self.config = cfg
-        self.auth = auth
-
-        self.total_taxa_count = 0
-        self.filtered_taxa_count = 0
-        self.undescribed_taxa_count = 0
-
-        self.request_count = 3
-        self.taxa_completed = 0
-        self.exceeded_download_max = False
-        self.taxa_remaining = 0
-
-    def filter_taxa(self, taxa_df):
-        df = taxa_df.copy()
-        df = df[df["is_described"] == 1]
-        self.total_taxa_count = len(taxa_df)
-        self.undescribed_taxa_count = len(taxa_df) - len(df)
-        self.filtered_taxa_count = len(df)
-        return df
-
-    def fetch_observations(self, taxa_df):
-        self.taxa_completed = len(taxa_df)
-        self.taxa_remaining = 0
-
-        taxon_id = int(taxa_df.iloc[0]["taxon_id"])
-
-        return ObservationResults(
-            observations=[
-                {
-                    "observation_id": 1001,
-                    "uuid": "uuid-1001",
-                    "observer_id": 1,
-                    "taxon_id": taxon_id,
-                    "user_id": 1,
-                    "license": "cc-by",
-                    "latitude": 37.8,
-                    "longitude": -122.4,
-                    "latitude_private": 37.2339,
-                    "longitude_private": -122.5234,
-                    "coordinate_precision": 10,
-                    "coordinate_precision_public": 50,
-                    "observed_on": "2024-03-15T00:00:00Z",
-                    "observed_on_string": "March 15, 2024",
-                    "created_at": "2024-03-16T10:00:00Z",
-                    "updated_at": "2024-03-17T10:00:00Z",
-                    "quality_grade": "research",
-                    "url": "https://www.inaturalist.org/observations/1001",
-                    "description": "Found near stream",
-                    "id_agreements": 3,
-                    "id_disagreements": 0,
-                    "captive_cultivated": False,
-                    "place_guess": "Somewhere",
-                    "place_guess_private": None,
-                    "obscured": True,
-                    "has_photo": True,
-                    "has_recording": False,
-                },
-                {
-                    "observation_id": 1002,
-                    "uuid": "uuid-1002",
-                    "observer_id": 2,
-                    "taxon_id": 100,
-                    "user_id": 2,
-                    "license": "cc-by",
-                    "latitude": 38.0,
-                    "longitude": -122.3,
-                    "latitude_private": 38.1,
-                    "longitude_private": -122.4,
-                    "coordinate_precision": 12,
-                    "coordinate_precision_public": 60,
-                    "observed_on": "2024-03-18T00:00:00Z",
-                    "observed_on_string": "March 18, 2024",
-                    "created_at": "2024-03-19T10:00:00Z",
-                    "updated_at": "2024-03-20T10:00:00Z",
-                    "quality_grade": "research",
-                    "url": "https://www.inaturalist.org/observations/1002",
-                    "description": "Second sample",
-                    "id_agreements": 2,
-                    "id_disagreements": 0,
-                    "captive_cultivated": False,
-                    "place_guess": "Elsewhere",
-                    "place_guess_private": None,
-                    "obscured": False,
-                    "has_photo": True,
-                    "has_recording": False,
-                },
-            ],
-            identifications=[
-                {
-                    "identification_id": 5,
-                    "observation_id": 1001,
-                    "user_id": 1,
-                    "taxon_id": 99,
-                    "created_at": "2024-03-16T12:00:00Z",
-                }
-            ],
-            users=[
-                {"id": 1, "login": "user1", "name": "User One"},
-                {"id": 2, "login": "user2", "name": "User Two"},
-            ],
-            annotations=[],
-            completed_taxa={99, 100},
-        )
+def _make_raw_observation(obs_id: int, taxon_id: int, user_id: int = 1) -> dict:
+    """
+    Minimal raw iNaturalist observation payload, matching the real API response shape
+    that ObservationDownloader._unpack_observation expects (same shape as
+    test_observations.py's observation_data fixture).
+    """
+    return {
+        "id": obs_id,
+        "uuid": f"uuid-{obs_id}",
+        "user": {"id": user_id, "login": f"user{user_id}", "name": f"User {user_id}"},
+        "community_taxon_id": taxon_id,
+        "license_code": "cc-by",
+        "geojson": {"coordinates": [-122.4, 37.8]},
+        "private_geojson": {"coordinates": [-122.5234, 37.2339]},
+        "positional_accuracy": 10,
+        "public_positional_accuracy": 50,
+        "observed_on": "2024-03-15",
+        "observed_on_string": "March 15, 2024",
+        "created_at": "2024-03-16T10:00:00Z",
+        "updated_at": "2024-03-17T10:00:00Z",
+        "quality_grade": "research",
+        "uri": f"https://www.inaturalist.org/observations/{obs_id}",
+        "description": "Found near stream",
+        "num_identification_agreements": 3,
+        "num_identification_disagreements": 0,
+        "captive": False,
+        "place_guess": "Somewhere",
+        "place_guess_private": None,
+        "obscured": True,
+        "photos": [{"id": 1}],
+        "sounds": [],
+        "identifications": [],
+        "annotations": [],
+    }
 
 
-class EmptyTaxaDownloader(FakeDownloader):
-    def filter_taxa(self, taxa_df):
-        self.total_taxa_count = len(taxa_df)
-        self.undescribed_taxa_count = len(taxa_df)
-        self.filtered_taxa_count = 0
-        return taxa_df.iloc[0:0]
-        
+def _fake_request_batch(observations_by_taxon: dict):
+    """
+    Returns a drop-in replacement for ObservationDownloader._request_batch that serves
+    canned raw observation payloads for whichever taxon ids appear in a given batch, so the
+    real fetch_observations/_get_batches/_unpack_results logic runs unmodified. This is the
+    only network boundary that gets faked.
+    """
+    def _request_batch(self, ids, params, headers):
+        self.request_count += 1
+        results = []
+        for taxon_id in ids:
+            results.extend(observations_by_taxon.get(taxon_id, []))
+        return results
+    return _request_batch
+
 
 class TestObservations:
-    
+
     @staticmethod
     def _seed_real_mapping(db_manager, rows):
+        """
+        Seeds tracking_taxa, genera, parent_taxa (as needed), inat_taxa, and tracking_rel
+        directly against the real schema, so the real `mappings` view - and therefore the
+        real ObservationDownloader.filter_taxa - sees accurate match_type/is_described
+        values instead of anything hand-computed by a fake.
+
+        Each row dict needs: est_id, taxon_id, sci_name, common_name, inat_name, elcode,
+        growth_habit, is_described, genus_egt_id, and match_level
+        ("exact"/"override"/"parent"/"genus", defaults to "exact"). Optional: parent_egt_id,
+        parent_sci_name, override_name.
+        """
         with db_manager as conn:
             for row in rows:
+                match_level = row.get("match_level", "exact")
+                parent_egt_id = row.get("parent_egt_id")
+
+                conn._conn.execute(
+                    "INSERT OR IGNORE INTO genera (genus_egt_id, genus_sci_name) VALUES (?, ?)",
+                    (row["genus_egt_id"], row.get("genus_sci_name", "Test genus")),
+                )
+
+                if parent_egt_id is not None:
+                    conn._conn.execute(
+                        "INSERT OR IGNORE INTO parent_taxa (parent_egt_id, parent_sci_name) VALUES (?, ?)",
+                        (parent_egt_id, row.get("parent_sci_name", "Test parent")),
+                    )
+
+                override_name = row.get("override_name") or (
+                    row["sci_name"] if match_level == "override" else None
+                )
+
                 conn._conn.execute(
                     """
                     INSERT INTO tracking_taxa (
-                        est_id, sci_name, search_name, is_described,
-                        element_type, scientific_name, common_name, element_name,
-                        family, author, egt_uid, srank, track_status,
-                        explorer, explorer_link, elcode, growth_habit, duration
+                        est_id, egt_id, sci_name, global_sci_name, override_name,
+                        classification_level, is_described, parent_egt_id, element_type,
+                        common_name, family, genus_egt_id, author, egt_uid, srank,
+                        track_status, explorer, elcode, growth_habit, duration
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         row["est_id"],
+                        row.get("egt_id", row["est_id"] + 9000),
                         row["sci_name"],
-                        row["search_name"],
+                        row.get("global_sci_name", row["sci_name"]),
+                        override_name,
+                        row.get("classification_level", "Species"),
                         row["is_described"],
+                        parent_egt_id,
                         "Plant",
-                        row["sci_name"],
                         row["common_name"],
-                        row["sci_name"],
                         "Testaceae",
+                        row["genus_egt_id"],
                         "Test Author",
                         "EGT-001",
                         "S5",
                         "Tracked",
-                        "https://example.org",
                         "https://example.org",
                         row["elcode"],
                         row["growth_habit"],
@@ -571,23 +525,27 @@ class TestObservations:
                 )
 
                 conn._conn.execute(
-                    """
-                    INSERT INTO inat_taxa (taxon_id, inat_name)
-                    VALUES (?, ?)
-                    """,
+                    "INSERT INTO inat_taxa (taxon_id, inat_name) VALUES (?, ?)",
                     (row["taxon_id"], row["inat_name"]),
                 )
 
+                # Which of est_id/parent_egt_id/genus_egt_id is populated on tracking_rel
+                # drives match_type in the mappings view.
                 conn._conn.execute(
                     """
-                    INSERT INTO tracking_rel (est_id, taxon_id)
-                    VALUES (?, ?)
+                    INSERT INTO tracking_rel (taxon_id, est_id, parent_egt_id, genus_egt_id)
+                    VALUES (?, ?, ?, ?)
                     """,
-                    (row["est_id"], row["taxon_id"]),
+                    (
+                        row["taxon_id"],
+                        row["est_id"] if match_level in ("exact", "override") else None,
+                        parent_egt_id if match_level == "parent" else None,
+                        row["genus_egt_id"] if match_level == "genus" else None,
+                    ),
                 )
 
             conn._conn.commit()
-    
+
     def test_get_observations_downloads_and_inserts_results_for_multiple_taxa(self, db_manager, cfg_obs):
         auth = MagicMock()
 
@@ -595,32 +553,28 @@ class TestObservations:
             db_manager,
             [
                 {
-                    "est_id": 101,
-                    "taxon_id": 99,
-                    "sci_name": "Test taxon 1",
-                    "search_name": "Test taxon 1",
-                    "common_name": "Test plant 1",
-                    "inat_name": "Test taxon 1",
-                    "elcode": "ABCD123",
-                    "growth_habit": "Forb",
-                    "is_described": 1,
+                    "est_id": 101, "taxon_id": 99, "sci_name": "Test taxon 1",
+                    "common_name": "Test plant 1", "inat_name": "Test taxon 1",
+                    "elcode": "ABCD123", "growth_habit": "Forb", "is_described": 1,
+                    "genus_egt_id": 501, "match_level": "exact",
                 },
                 {
-                    "est_id": 102,
-                    "taxon_id": 100,
-                    "sci_name": "Test taxon 2",
-                    "search_name": "Test taxon 2",
-                    "common_name": "Test plant 2",
-                    "inat_name": "Test taxon 2",
-                    "elcode": "EFGH456",
-                    "growth_habit": "Shrub",
-                    "is_described": 1,
+                    "est_id": 102, "taxon_id": 100, "sci_name": "Test taxon 2",
+                    "common_name": "Test plant 2", "inat_name": "Test taxon 2",
+                    "elcode": "EFGH456", "growth_habit": "Shrub", "is_described": 1,
+                    "genus_egt_id": 502, "match_level": "exact",
                 },
             ],
         )
 
-        with patch.object(pipeline.observations, "ObservationDownloader", FakeDownloader):
-            pipeline.get_observations(cfg_obs, db_manager, auth)
+        payloads = {
+            99: [_make_raw_observation(1001, taxon_id=99, user_id=1)],
+            100: [_make_raw_observation(1002, taxon_id=100, user_id=2)],
+        }
+
+        with patch.object(pipeline.observations.ObservationDownloader, "_get_fields_rison", return_value="fields"):
+            with patch.object(pipeline.observations.ObservationDownloader, "_request_batch", _fake_request_batch(payloads)):
+                pipeline.get_observations(cfg_obs, db_manager, auth)
 
         with db_manager as conn:
             obs_rows = conn.select("observations")
@@ -630,28 +584,28 @@ class TestObservations:
         assert {1001, 1002} == set(obs_rows["observation_id"])
         assert len(users_rows) == 2
 
-    def test_get_observations_skips_undescribed_taxa(self, db_manager, cfg_obs):
+    def test_get_observations_skips_non_exact_matches(self, db_manager, cfg_obs):
+        """A parent- or genus-level match (not exact/override) should be filtered out by
+        the real filter_taxa before any observations are downloaded at all."""
         auth = MagicMock()
 
         self._seed_real_mapping(
             db_manager,
             [
                 {
-                    "est_id": 101,
-                    "taxon_id": 99,
-                    "sci_name": "Undescribed taxon",
-                    "search_name": "Undescribed taxon",
-                    "common_name": "Undescribed plant",
-                    "inat_name": "Undescribed taxon",
-                    "elcode": "ZZZZ999",
-                    "growth_habit": "Forb",
-                    "is_described": 0,
+                    "est_id": 101, "taxon_id": 99, "sci_name": "Undescribed taxon",
+                    "common_name": "Undescribed plant", "inat_name": "Undescribed taxon",
+                    "elcode": "ZZZZ999", "growth_habit": "Forb", "is_described": 0,
+                    "genus_egt_id": 503, "match_level": "genus",
                 }
             ],
         )
 
-        with patch.object(pipeline.observations, "ObservationDownloader", EmptyTaxaDownloader):
-            pipeline.get_observations(cfg_obs, db_manager, auth)
+        with patch.object(pipeline.observations.ObservationDownloader, "_get_fields_rison", return_value="fields"):
+            with patch.object(pipeline.observations.ObservationDownloader, "_request_batch") as mock_request:
+                pipeline.get_observations(cfg_obs, db_manager, auth)
+
+        mock_request.assert_not_called()
 
         with db_manager as conn:
             obs_rows = conn.select("observations")
@@ -665,21 +619,17 @@ class TestObservations:
             db_manager,
             [
                 {
-                    "est_id": 101,
-                    "taxon_id": 99,
-                    "sci_name": "Test taxon",
-                    "search_name": "Test taxon",
-                    "common_name": "Test plant",
-                    "inat_name": "Test taxon",
-                    "elcode": "ABCD123",
-                    "growth_habit": "Forb",
-                    "is_described": 1,
+                    "est_id": 101, "taxon_id": 99, "sci_name": "Test taxon",
+                    "common_name": "Test plant", "inat_name": "Test taxon",
+                    "elcode": "ABCD123", "growth_habit": "Forb", "is_described": 1,
+                    "genus_egt_id": 504, "match_level": "exact",
                 }
             ],
         )
 
-        with patch.object(pipeline.observations, "ObservationDownloader", EmptyTaxaDownloader):
-            pipeline.get_observations(cfg_obs, db_manager, auth)
+        with patch.object(pipeline.observations.ObservationDownloader, "_get_fields_rison", return_value="fields"):
+            with patch.object(pipeline.observations.ObservationDownloader, "_request_batch", _fake_request_batch({})):
+                pipeline.get_observations(cfg_obs, db_manager, auth)
 
         with db_manager as conn:
             obs_rows = conn.select("observations")
@@ -687,6 +637,8 @@ class TestObservations:
         assert len(obs_rows) == 0
 
     def test_get_observations_noop_when_filtered_taxa_are_empty(self, db_manager, cfg_obs):
+        """A genus-only mapping row (no tracking_taxa seeded, just inat_taxa/tracking_rel
+        via insert_mappings) should be filtered out entirely."""
         auth = MagicMock()
 
         with db_manager as conn:
@@ -694,36 +646,37 @@ class TestObservations:
                 pd.DataFrame(
                     [
                         {
-                            "est_id": 101,
                             "taxon_id": 99,
                             "inat_name": "Test taxon",
-                            "sci_name": "Test taxon",
-                            "search_name": "Test taxon",
-                            "is_described": 0,
-                            "date_updated": None,
+                            "est_id": None,
+                            "parent_egt_id": None,
+                            "genus_egt_id": 505,
                         }
                     ]
                 )
             )
 
-        with patch.object(pipeline.observations, "ObservationDownloader", EmptyTaxaDownloader):
-            result = pipeline.get_observations(cfg_obs, db_manager, auth)
+        with patch.object(pipeline.observations.ObservationDownloader, "_get_fields_rison", return_value="fields"):
+            with patch.object(pipeline.observations.ObservationDownloader, "_request_batch") as mock_request:
+                result = pipeline.get_observations(cfg_obs, db_manager, auth)
 
         assert result is None
+        mock_request.assert_not_called()
 
         with db_manager as conn:
             obs_rows = conn.select("observations")
 
         assert len(obs_rows) == 0
 
-
     def test_get_observations_noop_when_no_mappings_exist(self, db_manager, cfg_obs):
         auth = MagicMock()
 
-        with patch.object(pipeline.observations, "ObservationDownloader", FakeDownloader):
-            result = pipeline.get_observations(cfg_obs, db_manager, auth)
+        with patch.object(pipeline.observations.ObservationDownloader, "_get_fields_rison", return_value="fields"):
+            with patch.object(pipeline.observations.ObservationDownloader, "_request_batch") as mock_request:
+                result = pipeline.get_observations(cfg_obs, db_manager, auth)
 
         assert result is None
+        mock_request.assert_not_called()
 
         with db_manager as conn:
             obs_rows = conn.select("observations")
@@ -869,91 +822,55 @@ class TestReview:
         # Insert taxa
         with db_manager as conn:
             conn._conn.execute(
+                "INSERT INTO genera (genus_egt_id, genus_sci_name) VALUES (?, ?)",
+                (601, "Testus"),
+            )
+            conn._conn.execute(
                 """
                 INSERT INTO tracking_taxa (
-                    est_id, sci_name, search_name, is_described,
-                    element_type, scientific_name, common_name, element_name,
-                    family, author, egt_uid, srank, track_status,
-                    explorer, explorer_link, elcode, growth_habit, duration
+                    est_id, egt_id, sci_name, global_sci_name, override_name,
+                    classification_level, is_described, parent_egt_id, element_type,
+                    common_name, family, genus_egt_id, author, egt_uid, srank,
+                    track_status, explorer, elcode, growth_habit, duration
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    101,
-                    "Test taxon",
-                    "Test taxon",
-                    1,
-                    "Plant",
-                    "Test taxon",
-                    "Test plant",
-                    "Test taxon",
-                    "Testaceae",
-                    "Test Author",
-                    "uid_1",
-                    "S5",
-                    "Tracked",
-                    "https://example.org",
-                    "https://example.org",
-                    "ABCD123",
-                    "Forb",
-                    "Perennial",
+                    101, 9101, "Test taxon", "Test taxon", None, "Species", 1, None,
+                    "Plant", "Test plant", "Testaceae", 601, "Test Author", "uid_1",
+                    "S5", "Tracked", "https://example.org", "ABCD123", "Forb", "Perennial",
                 ),
             )
 
             conn._conn.execute(
-                """
-                INSERT INTO inat_taxa (taxon_id, inat_name)
-                VALUES (?, ?)
-                """,
+                "INSERT INTO inat_taxa (taxon_id, inat_name) VALUES (?, ?)",
                 (10, "Test taxon"),
             )
 
             conn._conn.execute(
-                """
-                INSERT INTO tracking_rel (taxon_id, est_id)
-                VALUES (?, ?)
-                """,
+                "INSERT INTO tracking_rel (taxon_id, est_id) VALUES (?, ?)",
                 (10, 101),
             )
             conn._conn.commit()
 
-        # Seed observations
+        # Seed observations (unchanged)
         raw_result = ObservationResults(
             observations=[
                 {
-                    "observation_id": 101,
-                    "uuid": "uuid-101",
-                    "observer_id": 1,
-                    "taxon_id": 10,
-                    "user_id": 1,
-                    "license": "cc-by",
-                    "latitude": 44.1,
-                    "longitude": -123.2,
-                    "latitude_private": None,
-                    "longitude_private": None,
-                    "coordinate_precision": 20,
-                    "coordinate_precision_public": 20,
-                    "observed_on": "2024-05-01T12:00:00Z",
-                    "observed_on_string": "2024-05-01 12:00",
-                    "created_at": "2024-05-01T00:00:00Z",
-                    "updated_at": "2024-05-02T00:00:00Z",
-                    "quality_grade": "research",
-                    "url": "https://example.com/101",
-                    "description": "First observation",
-                    "id_agreements": 1,
-                    "id_disagreements": 0,
-                    "captive_cultivated": False,
-                    "place_guess": "Portland",
-                    "place_guess_private": None,
-                    "obscured": False,
-                    "has_photo": True,
-                    "has_recording": False,
+                    "observation_id": 101, "uuid": "uuid-101", "observer_id": 1, "taxon_id": 10,
+                    "user_id": 1, "license": "cc-by", "latitude": 44.1, "longitude": -123.2,
+                    "latitude_private": None, "longitude_private": None, "coordinate_precision": 20,
+                    "coordinate_precision_public": 20, "observed_on": "2024-05-01T12:00:00Z",
+                    "observed_on_string": "2024-05-01 12:00", "created_at": "2024-05-01T00:00:00Z",
+                    "updated_at": "2024-05-02T00:00:00Z", "quality_grade": "research",
+                    "url": "https://example.com/101", "description": "First observation",
+                    "id_agreements": 1, "id_disagreements": 0, "captive_cultivated": False,
+                    "place_guess": "Portland", "place_guess_private": None, "obscured": False,
+                    "has_photo": True, "has_recording": False,
                 }
             ],
             identifications=[],
-            users=[
-                {"id": 1, "login": "alice", "name": "Alice Example"}
-            ],
+            users=[{"id": 1, "login": "alice", "name": "Alice Example"}],
             annotations=[],
             completed_taxa={10},
         )
@@ -1016,10 +933,11 @@ class TestReview:
         ).to_csv(experts_file, index=False)
 
         cfg_review = config.ReviewConfig(
-            export_csv=str(export_file),
+            export_path=str(export_file),
             experts_id_field=validation.EXPERTS_INAT_ID_FIELD,
             experts_expertise_field=validation.EXPERTS_EXPERTISE_FIELD,
             experts_file=str(experts_file),
+            export_format=pipeline.EXPORT_FORMAT_CSV
         )
 
         pipeline.run_review(cfg_review, db_manager)
@@ -1040,71 +958,47 @@ class TestFullPipeline:
         pd.DataFrame(
             [
                 {
-                    "name": 101,
-                    "sname": "Carex stipata",
-                    "author": "Muhlenberg ex Willdenow",
-                    "scomname": "owlfruit sedge",
-                    "s_rank": "S5",
-                    "eo_track_status_desc": "Tracked",
+                    "est_id": 101, "egt_id": 5001, "sci_name": "Carex stipata",
+                    "global_sci_name": "Carex stipata", "classification_level": "Species",
+                    "parent_egt_id": None, "parent_sci_name": None, "element_type": "Plant",
+                    "scomname": "owlfruit sedge", "family": "Cyperaceae", "genus_egt_id": 201,
+                    "genus": "Carex", "author": "Muhlenberg ex Willdenow", "egt_uid": "EGT-001",
+                    "s_rank": "S5", "eo_track_status_desc": "Tracked",
                     "explorer": "https://example.org/explorer/carex-stipata",
-                    "egt_uid": "EGT-001",
-                    "family": "Cyperaceae",
-                    "ELCODE_BCD": "ABNAB",
-                    "NAME_CATEGORY_DESC": "Vascular plant",
-                    "growth_habit": "Sedge",
-                    "element_type": "Plant",
-                    "duration": "Perennial",
+                    "elcode_bcd": "ABNAB", "name_category_desc": "Vascular plant",
+                    "growth_habit": "Sedge", "duration": "Perennial",
                 },
                 {
-                    "name": 102,
-                    "sname": "Aster amellus",
-                    "author": "L.",
-                    "scomname": "European starwort",
-                    "s_rank": "S4",
-                    "eo_track_status_desc": "Tracked",
+                    "est_id": 102, "egt_id": 5002, "sci_name": "Aster amellus",
+                    "global_sci_name": "Aster amellus", "classification_level": "Species",
+                    "parent_egt_id": None, "parent_sci_name": None, "element_type": "Plant",
+                    "scomname": "European starwort", "family": "Asteraceae", "genus_egt_id": 202,
+                    "genus": "Aster", "author": "L.", "egt_uid": "EGT-002",
+                    "s_rank": "S4", "eo_track_status_desc": "Tracked",
                     "explorer": "https://example.org/explorer/aster-amellus",
-                    "egt_uid": "EGT-002",
-                    "family": "Asteraceae",
-                    "ELCODE_BCD": "ABNAB",
-                    "NAME_CATEGORY_DESC": "Vascular plant",
-                    "growth_habit": "Forb",
-                    "element_type": "Plant",
-                    "duration": "Perennial",
+                    "elcode_bcd": "ABNAB", "name_category_desc": "Vascular plant",
+                    "growth_habit": "Forb", "duration": "Perennial",
                 },
                 {
-                    "name": 103,
-                    "sname": "Nuphar advena",
-                    "author": "Aiton",
-                    "scomname": "spadderdock",
-                    "s_rank": "S5",
-                    "eo_track_status_desc": "Tracked",
+                    "est_id": 103, "egt_id": 5003, "sci_name": "Nuphar advena",
+                    "global_sci_name": "Nuphar advena", "classification_level": "Species",
+                    "parent_egt_id": None, "parent_sci_name": None, "element_type": "Plant",
+                    "scomname": "spadderdock", "family": "Nymphaeaceae", "genus_egt_id": 203,
+                    "genus": "Nuphar", "author": "Aiton", "egt_uid": "EGT-003",
+                    "s_rank": "S5", "eo_track_status_desc": "Tracked",
                     "explorer": "https://example.org/explorer/nuphar-advena",
-                    "egt_uid": "EGT-003",
-                    "family": "Nymphaeaceae",
-                    "ELCODE_BCD": "ABNAB",
-                    "NAME_CATEGORY_DESC": "Vascular plant",
-                    "growth_habit": "Aquatic",
-                    "element_type": "Plant",
-                    "duration": "Perennial",
+                    "elcode_bcd": "ABNAB", "name_category_desc": "Vascular plant",
+                    "growth_habit": "Aquatic", "duration": "Perennial",
                 },
             ]
         ).to_csv(path, index=False)
-
 
     @staticmethod
     def _write_overrides_csv(path: Path):
         pd.DataFrame(
             [
-                {
-                    "est_id": 101,
-                    "inat_name": "Carex stipata",
-                    "taxon_id": 12345,
-                },
-                {
-                    "est_id": 102,
-                    "inat_name": "Aster amellus",
-                    "taxon_id": 67890,
-                },
+                {"est_id": 101, "inat_name": "Carex stipata", "taxon_id": 12345},
+                {"est_id": 102, "inat_name": "Aster amellus", "taxon_id": 67890},
             ]
         ).to_csv(path, index=False)
 
@@ -1118,8 +1012,11 @@ class TestFullPipeline:
         self._write_tracking_csv(tracking)
         self._write_overrides_csv(overrides)
 
-        pipeline.build_taxon_mapping(str(tracking), str(overrides), db_manager, auth)
+        with patch.object(pipeline.taxa, "TaxonMappingBuilder", FakeTaxonMappingBuilder):
+            pipeline.build_taxon_mapping(str(tracking), str(overrides), db_manager, auth)
 
+        # 2) download observations - est_id 101/102 resolve via override (12345/67890),
+        # 103 via FakeTaxonMappingBuilder's "Nuphar advena" entry (99999)
         cfg_obs = config.ObservationsConfig(
             place_id=10,
             quality_grade="research",
@@ -1130,8 +1027,15 @@ class TestFullPipeline:
             max_observations=10000,
         )
 
-        with patch("inatdatapipeline.pipeline.observations.ObservationDownloader", FakeDownloader):
-            pipeline.get_observations(cfg_obs, db_manager, auth)
+        payloads = {
+            12345: [_make_raw_observation(2001, taxon_id=12345, user_id=1)],
+            67890: [_make_raw_observation(2002, taxon_id=67890, user_id=1)],
+            99999: [_make_raw_observation(2003, taxon_id=99999, user_id=1)],
+        }
+
+        with patch.object(pipeline.observations.ObservationDownloader, "_get_fields_rison", return_value="fields"):
+            with patch.object(pipeline.observations.ObservationDownloader, "_request_batch", _fake_request_batch(payloads)):
+                pipeline.get_observations(cfg_obs, db_manager, auth)
 
         # 3) project members + annotations + review
         with patch("inatdatapipeline.pipeline.helpers.fetch_project_members", return_value=[1]):
@@ -1148,7 +1052,7 @@ class TestFullPipeline:
         experts_file = tmp_path / "experts.csv"
         pd.DataFrame(
             [{
-                validation.EXPERTS_INAT_ID_FIELD: 1001, 
+                validation.EXPERTS_INAT_ID_FIELD: 1001,
                 validation.EXPERTS_EXPERTISE_FIELD: "Plant"
             }]
         ).to_csv(experts_file, index=False)
@@ -1158,14 +1062,11 @@ class TestFullPipeline:
             experts_file=str(experts_file),
             experts_id_field=validation.EXPERTS_INAT_ID_FIELD,
             experts_expertise_field=validation.EXPERTS_EXPERTISE_FIELD,
-            export_csv=str(export_csv),
+            export_path=str(export_csv),
+            export_format="CSV File",
         )
 
         pipeline.run_review(cfg_review, db_manager)
-
-        with open(export_csv, "r") as fp:
-            while (line := fp.readline()):
-                print(line)
 
         assert export_csv.exists()
         assert export_csv.stat().st_size > 0

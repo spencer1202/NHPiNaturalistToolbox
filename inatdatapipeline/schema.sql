@@ -7,25 +7,42 @@ CREATE TABLE IF NOT EXISTS stats (
 );
 
 -- Taxa tables
--- TODO streamline tracking taxa table, add derived fields on export
+CREATE TABLE IF NOT EXISTS parent_taxa (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent_egt_id   int     UNIQUE NOT NULL,
+    parent_sci_name text
+);
+INSERT OR IGNORE INTO gpkg_contents (table_name, data_type, identifier)
+VALUES ('parent_taxa', 'attributes', 'parent_taxa');
+
+CREATE TABLE IF NOT EXISTS genera (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    genus_egt_id    int     UNIQUE NOT NULL,
+    genus_sci_name  text
+);
+INSERT OR IGNORE INTO gpkg_contents (table_name, data_type, identifier)
+VALUES ('genera', 'attributes', 'genera');
+
 CREATE TABLE IF NOT EXISTS tracking_taxa (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     est_id                int     UNIQUE NOT NULL,
-    sci_name              text,
-    search_name           text,
-    is_described          boolean CHECK (is_described IN (NULL, true, false)),
+    egt_id                int     UNIQUE NOT NULL,
+    sci_name              text    NOT NULL,
+    global_sci_name       text    NOT NULL,
+    override_name         text,
+    classification_level  text    NOT NULL,
+    is_described          boolean CHECK (is_described IN (NULL, true, false)) NOT NULL,
+    parent_egt_id         int     REFERENCES parent_taxa(parent_egt_id) ON DELETE CASCADE,
     element_type          text,
-    scientific_name       text,
     common_name           text,
-    element_name          text,
     family                text,
+    genus_egt_id          int     NOT NULL REFERENCES genera(genus_egt_id) ON DELETE CASCADE,
     author                text,
-    egt_uid               int     NOT NULL,
+    egt_uid               int,
     srank                 text,
     track_status          text,
     explorer              text,
-    explorer_link         text,
-    elcode                text    NOT NULL,
+    elcode                text,
     growth_habit          text,
     duration              text
 );
@@ -34,7 +51,7 @@ VALUES ('tracking_taxa', 'attributes', 'tracking_taxa');
 
 CREATE TABLE IF NOT EXISTS inat_taxa (
     id                    INTEGER     PRIMARY KEY AUTOINCREMENT,
-    taxon_id              int     UNIQUE NOT NULL,
+    taxon_id              int         UNIQUE NOT NULL,
     inat_name             text,
     date_updated          text
 );
@@ -44,8 +61,9 @@ VALUES ('inat_taxa', 'attributes', 'inat_taxa');
 CREATE TABLE IF NOT EXISTS tracking_rel (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     taxon_id              int     NOT NULL REFERENCES inat_taxa(taxon_id) ON DELETE CASCADE,
-    est_id                int     NOT NULL REFERENCES tracking_taxa(est_id) ON DELETE CASCADE,
-    UNIQUE(taxon_id, est_id)
+    est_id                int     UNIQUE REFERENCES tracking_taxa(est_id) ON DELETE CASCADE,
+    parent_egt_id         int     UNIQUE REFERENCES parent_taxa(parent_egt_id) ON DELETE CASCADE,
+    genus_egt_id          int     UNIQUE REFERENCES genera(genus_egt_id) ON DELETE CASCADE
 );
 INSERT OR IGNORE INTO gpkg_contents (table_name, data_type, identifier)
 VALUES ('tracking_rel', 'attributes', 'tracking_rel');
@@ -59,22 +77,50 @@ BEGIN
 END;
 
 DROP TRIGGER IF EXISTS trg_tracking_cascade_delete;
-CREATE TRIGGER IF NOT EXISTS trg_tracking_cascade_delete
+CREATE TRIGGER trg_tracking_cascade_delete
 AFTER DELETE ON tracking_taxa
 FOR EACH ROW
 BEGIN
-    -- Delete inat_taxa only if this was the only matching tracking_taxa
-    DELETE FROM inat_taxa
-    WHERE taxon_id IN (
-        SELECT taxon_id FROM tracking_rel WHERE est_id = OLD.est_id
+    -- est_id-linked tracking_rel rows are removed automatically via
+    -- ON DELETE CASCADE on tracking_rel.est_id -> tracking_taxa.est_id
+    DELETE FROM tracking_rel
+    WHERE (
+        -- Parent-level fallback: only delete if no remaining tracking_taxa
+        -- row under this parent still lacks its own est-specific rel row
+        OLD.parent_egt_id IS NOT NULL
+        AND parent_egt_id = OLD.parent_egt_id
+        AND NOT EXISTS (
+            SELECT 1 FROM tracking_taxa
+            WHERE parent_egt_id = OLD.parent_egt_id
+            AND est_id NOT IN (SELECT est_id FROM tracking_rel WHERE est_id IS NOT NULL)
+        )
     )
-    AND taxon_id NOT IN (
-        SELECT taxon_id FROM tracking_rel WHERE est_id != OLD.est_id
+    OR (
+        -- Genus-level fallback: same idea, one level up
+        genus_egt_id = OLD.genus_egt_id
+        AND NOT EXISTS (
+            SELECT 1 FROM tracking_taxa
+            WHERE genus_egt_id = OLD.genus_egt_id
+            AND est_id NOT IN (SELECT est_id FROM tracking_rel WHERE est_id IS NOT NULL)
+        )
     );
-    -- Remove tracking_rel entry
-    DELETE FROM tracking_rel WHERE est_id = OLD.est_id;
-END; 
+END;
 
+DROP TRIGGER IF EXISTS trg_tracking_rel_cascade_delete;
+CREATE TRIGGER trg_tracking_rel_cascade_delete
+AFTER DELETE ON tracking_rel
+FOR EACH ROW
+BEGIN
+    -- A tracking_rel row disappearing (directly, via cascade from a
+    -- tracking_taxa delete, or via the fallback cleanup above) means
+    -- nothing vouches for that inat mapping anymore, UNLESS some other
+    -- tracking_rel row still points at the same taxon.
+    DELETE FROM inat_taxa
+    WHERE taxon_id = OLD.taxon_id
+    AND NOT EXISTS (
+        SELECT 1 FROM tracking_rel WHERE tracking_rel.taxon_id = OLD.taxon_id
+    );
+END;
 
 -- Observation tables
 CREATE TABLE IF NOT EXISTS users (
@@ -183,43 +229,69 @@ VALUES ('project_members', 'attributes', 'project_members');
 
 
 -- Views
-CREATE VIEW IF NOT EXISTS mappings (
-    est_id, 
-    elcode, 
-    sci_name, 
-    search_name,
+DROP VIEW IF EXISTS mappings;
+CREATE VIEW mappings(
+    est_id,
+    egt_id,
+    elcode,
+    sci_name,
+    override_name,
+    parent_egt_id,
+    parent_sci_name,
+    genus_egt_id,
+    genus_sci_name,
+    common_name,
+    classification_level,
     is_described,
-    common_name, 
-    taxon_id, 
-    inat_name, 
-    date_updated
-) AS SELECT 
-    tt.est_id, 
-    tt.elcode, 
-    tt.sci_name, 
-    tt.search_name,
+    match_element_id,
+    taxon_id,
+    inat_name,
+    date_updated,
+    match_type
+)
+AS SELECT
+    tt.est_id,
+    tt.egt_id,
+    tt.elcode,
+    tt.sci_name,
+    tt.override_name,
+    tr.parent_egt_id,
+    pt.parent_sci_name,
+    tr.genus_egt_id,
+    gt.genus_sci_name,
+    tt.common_name,
+    tt.classification_level,
     tt.is_described,
-    tt.common_name, 
-    it.taxon_id, 
-    it.inat_name, 
-    it.date_updated
-FROM tracking_taxa AS tt
-JOIN tracking_rel AS tr ON tt.est_id = tr.est_id
-JOIN inat_taxa AS it ON tr.taxon_id = it.taxon_id
-;
+    COALESCE(tr.est_id, tr.parent_egt_id, tr.genus_egt_id) AS match_element_id,
+    tr.taxon_id,
+    it.inat_name,
+    it.date_updated,
+    CASE
+        WHEN tr.genus_egt_id IS NOT NULL  THEN 'genus'
+        WHEN tr.parent_egt_id IS NOT NULL THEN 'parent'
+        WHEN tt.override_name IS NOT NULL THEN 'override'
+        ELSE 'exact'
+    END AS match_type
+FROM inat_taxa it
+JOIN tracking_rel tr ON it.taxon_id=tr.taxon_id 
+LEFT JOIN parent_taxa pt ON tr.parent_egt_id=pt.parent_egt_id 
+LEFT JOIN genera gt ON tr.genus_egt_id=gt.genus_egt_id
+LEFT JOIN tracking_taxa tt ON (
+    tr.est_id=tt.est_id
+    OR (
+        pt.parent_egt_id=tt.parent_egt_id 
+        AND tt.est_id NOT IN (SELECT est_id FROM tracking_rel WHERE est_id IS NOT NULL)
+    )
+    OR (
+        gt.genus_egt_id=tt.genus_egt_id
+        AND tt.est_id NOT IN (SELECT est_id FROM tracking_rel WHERE est_id IS NOT NULL)
+    )
+);
 INSERT OR IGNORE INTO gpkg_contents (table_name, data_type, identifier)
 VALUES ('mappings', 'attributes', 'mappings');
 
-CREATE VIEW IF NOT EXISTS not_in_inat 
-AS SELECT * 
-FROM tracking_taxa AS tt
-LEFT JOIN tracking_rel AS tr
-ON tt.est_id = tr.est_id
-WHERE tr.est_id IS NULL
-;
-INSERT OR IGNORE INTO gpkg_contents (table_name, data_type, identifier)
-VALUES ('not_in_inat', 'attributes', 'not_in_inat');
 
+DROP VIEW IF EXISTS expert_identifications;
 CREATE VIEW IF NOT EXISTS expert_identifications (
     identification_id,
     observation_id,
@@ -256,6 +328,7 @@ JOIN users AS us
 INSERT OR IGNORE INTO gpkg_contents (table_name, data_type, identifier)
 VALUES ('expert_identifications', 'attributes', 'expert_identifications');
 
+DROP VIEW IF EXISTS annotations_with_labels;
 CREATE VIEW IF NOT EXISTS annotations_with_labels (
     observation_id,
     annotation_id,
@@ -280,6 +353,8 @@ JOIN annotation_options ao
     ON ann.annotation_id = ao.annotation_id
 ;
 
+-- TODO fix
+DROP VIEW IF EXISTS full_observations;
 CREATE VIEW IF NOT EXISTS full_observations
 AS SELECT
     obs.observation_id,
@@ -311,20 +386,24 @@ AS SELECT
     obs.has_photo,
     obs.has_recording,
     tt.est_id,
-    tt.element_type,
+    tt.egt_id,
     tt.sci_name,
-    tt.search_name,
+    tt.global_sci_name,
+    tt.override_name,
+    tt.classification_level,
     tt.is_described,
-    tt.scientific_name,
+    tt.parent_egt_id,
+    pt.parent_sci_name,
+    tt.element_type,
     tt.common_name,
-    tt.element_name,
     tt.family,
+    tt.genus_egt_id,
+    ge.genus_sci_name,
     tt.author,
     tt.egt_uid,
     tt.srank,
     tt.track_status,
     tt.explorer,
-    tt.explorer_link,
     tt.elcode,
     tt.growth_habit,
     tt.duration
@@ -335,6 +414,10 @@ LEFT JOIN tracking_rel tr
     ON obs.taxon_id = tr.taxon_id
 JOIN tracking_taxa tt
     ON tt.est_id = tr.est_id
+LEFT JOIN parent_taxa pt
+    ON tt.parent_egt_id = pt.parent_egt_id
+LEFT JOIN genera ge
+    ON tt.genus_egt_id = ge.genus_egt_id
 ;
 INSERT OR IGNORE INTO gpkg_contents (table_name, data_type, identifier)
 VALUES ('full_observations', 'attributes', 'full_observations');
