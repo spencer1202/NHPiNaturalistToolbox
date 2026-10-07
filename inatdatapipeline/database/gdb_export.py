@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pandera as pa
 import typing
-from inatdatapipeline.schemas import validation
+from inatdatapipeline import schemas
 import logging
 
 logger = logging.getLogger("pipeline")
@@ -76,7 +76,7 @@ def write_point_feature_class(
 
     logger.debug("Adding fields...")
     field_schema = build_field_schema(
-        validation.ExportSchema, text_length_overrides=text_length_overrides
+        schemas.ExportSchema, text_length_overrides=text_length_overrides
     )
     arcpy.management.AddFields(out_feature_class, field_schema)
 

@@ -1,10 +1,8 @@
 """
 observations.py
 
-This module defines the ObservationDownloader class, which uses the iNaturalist API to download
-observations and their corresponding identifications, users, and annotations, then structures
-the results into an ObservationResults object. ObservationResultsValidator validates those
-results and converts them into SQLite-ready records.
+This module is responsible for downloading iNaturalist observations and structuring them into the
+database schema. 
 """
 #### Standard imports ####
 import datetime as dt
@@ -16,37 +14,36 @@ from dataclasses import dataclass, field
 
 #### Third-party imports ####
 import pandas as pd
+from pandera.errors import SchemaError
+from pandera.typing import DataFrame
 import prison
 
 #### Local imports ####
 from inatdatapipeline.client import helpers
+from inatdatapipeline import config
 from inatdatapipeline.schemas import (
-    config,
-    validation
+    INatTaxaSchema,
+    ObservationSchema,
+    IdentificationsSchema,
+    UsersSchema,
+    AnnotationsSchema,
+    DATE_FORMAT
 )
-from inatdatapipeline.client.authentication import (
-    INaturalistAuth
-)
+
+from inatdatapipeline.client.authentication import INaturalistAuth
 
 #### Setup ####
 logger = logging.getLogger('pipeline')
 
 # Location of file with observation fields to search for
 FIELDS_FILE = "obs_fields.json"
-fields_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), FIELDS_FILE)
+FIELDS_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), FIELDS_FILE)
 
-# ---------------------------------------------------------------------------
-# ObservationResults
-# ---------------------------------------------------------------------------
+
 @dataclass
-class ObservationResults():
+class ObservationResultsRaw:
     """
-    Structured results of the iNaturalist observation requests.
-    * **observations**: DataFrame of iNaturalist observations.
-    * **identifications**: DataFrame of identifications for the returned observations.
-    * **users**: DataFrame of users, both observers and identifiers.
-    * **annotations**: All of the annotations left on the observations.
-    * **completed_taxa**: Set of taxon IDs for which all observations have been recieved.
+    Structures results of the iNaturalist observation requests.
     """
     observations    : list[dict]    = field(default_factory=list)
     identifications : list[dict]    = field(default_factory=list)
@@ -55,114 +52,15 @@ class ObservationResults():
     completed_taxa  : set           = field(default_factory=set)
 
 
-# ---------------------------------------------------------------------------
-# Observation Downloader
-# ---------------------------------------------------------------------------
-class ObservationDownloader():
+@dataclass
+class ObservationUnpacker(ObservationResultsRaw):
     """
-    Responsible for the downloading observations from iNaturalist. Tracks download stats.
+    Adds a working list of users and observation IDs, with methods to assist unpacking API results
+    into the ObservationResultsRaw structure.
     """
-    def __init__(self, cfg: config.ObservationsConfig, auth: INaturalistAuth):
-        self.auth: INaturalistAuth = auth
-        self.config: config.ObservationsConfig = cfg
-
-        # Stats
-        self.request_count          : int = 0
-        self.total_taxa_count       : int = 0
-        self.filtered_taxa_count    : int = 0
-        self.undescribed_taxa_count : int = 0
-        self.taxa_completed         : int = 0
-        self.exceeded_download_max  : bool = False
-
-
-    @staticmethod
-    def _get_batches(full_list: list, batch_size: int):
-        """Helper function to yield successive n-sized chunks from list"""
-        full_list.sort()
-        for i in range(0, len(full_list), batch_size):
-            yield full_list[i:i + batch_size]
-
-    @staticmethod
-    def _create_date_taxon_map(taxa_df: pd.DataFrame) -> dict[str: set]:
-        """
-        Creates a map that groups taxon_ids into sets with date_updated as the key.
-        Args:
-            taxa_df: 
-                Taxa dataframe to create a date map from
-        Returns:
-            Dictionary that maps a date string to a set of taxon IDs.
-        """
-        df = taxa_df.sort_values(by="taxon_id", ascending=True).copy()
-        date_taxon_map: dict = (
-            df
-            .groupby("date_updated")["taxon_id"]
-            .apply(set)
-            .to_dict()
-        )
-        date_taxon_map["None"] = (
-            set(df
-                .loc[df["date_updated"].isna(), "taxon_id"]
-                .sort_values(ascending=True)
-            )
-        )
-        return date_taxon_map
-
-    def _request_batch(self, ids: list, params: dict, headers: str) -> list:
-        """
-        Download iNaturalist observations for a list of ID. Adds to this object's request count.
-        Args:
-            ids:
-                List of taxon IDs to download observations for.
-            params:
-                Base HTTP request parameters.
-            headers:
-                HTTP authentication headers.
-        Returns:
-            A list of result dictionaries decoded from the HTTP response.
-        """
-        params["taxon_id"] = ",".join(str(id) for id in ids)
-        url = "https://api.inaturalist.org/v2/observations"
-
-        result, count = helpers.sliding_page_requests(url, params, headers)
-        self.request_count += count
-
-        return result
-
-    def _apply_date_filter(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Filters the dataframe for taxa that were last updated more than update_days ago. If
-        update_days is zero or None, set all taxas' date_updated column to None.
-        """
-        df = df.copy()
-        # If days_updated is zero, update all taxa without a date filter.
-        if not self.config.update_after_days:
-            df["date_updated"] = None
-
-        # Filter for taxa queried more than days_updated before now
-        else:
-            target_date = dt.date.today() - dt.timedelta(days=self.config.update_after_days)
-            date_mask = pd.to_datetime(df["date_updated"]) <= pd.Timestamp(target_date)
-            df = df[(df["date_updated"].isna()) | date_mask]
-
-        return df
-
-    @staticmethod
-    def _get_fields_rison() -> str:
-        """
-        Helper function that reads the contents of the provided JSON file and returns a RISON
-        encoded string.
-        """
-        try:
-            with open(fields_file_path, "r", encoding="latin-1") as fp:
-                fields_dict = json.load(fp)
-
-        except FileNotFoundError as ex:
-            raise ValueError(f"Fields JSON file not found: {fields_file_path}") from ex
-
-        except json.JSONDecodeError as ex:
-            raise ValueError(f"Failed to parse fields JSON file: {fields_file_path}") from ex
-
-        return prison.dumps(fields_dict)
+    max_reached     : bool  = False
+    users_set       : set   = field(default_factory=set)
+    obs_id_set      : set   = field(default_factory=set)
 
     @staticmethod
     def _unpack_observation(data) -> list[dict]:
@@ -299,83 +197,273 @@ class ObservationDownloader():
 
         return annotations
 
-    @staticmethod
-    def _unpack_results(data: list, all_observations: ObservationResults, users_set: set, obs_id_set: set):
+    def unpack_results(self, new_data: list):
         """
-        Extract observations, identifications, and users from a list of nested dictionaries
-        into the ObservationsResult object. Mutates all_observations and returns the updated 
-        users_set and obs_id_set.
+        Extract observations, identifications, and users from `data`, a list of nested
+        dictionaries, and appends them to this object's result lists.
         """
-        users_set = users_set.copy()
-        obs_id_set = obs_id_set.copy()
-
-        for result in data:
+        # TODO refactor to move loop outside of method
+        for result in new_data:
             # Check for duplicate observations
             obs_id = result.get("id")
-            if obs_id in obs_id_set:
+            if obs_id in self.obs_id_set:
                 logger.warning("Encountered duplicate observation ID: %s", obs_id)
                 continue
-            obs_id_set.add(obs_id)
+            self.obs_id_set.add(obs_id)
 
             # Add new observation
-            observation = ObservationDownloader._unpack_observation(result)
-            all_observations.observations.append(observation)
+            observation = ObservationUnpacker._unpack_observation(result)
+            self.observations.append(observation)
 
             # Add annotations
-            annotations = ObservationDownloader._unpack_annotations(
+            annotations = ObservationUnpacker._unpack_annotations(
                 observation.get("observation_id"),
                 result.get("annotations")
             )
             if annotations is not None:
-                all_observations.annotations.extend(annotations)
+                self.annotations.extend(annotations)
 
             # Get user who made the observation, add to users set if not already present
             obs_user = result.get("user", {})
-            if obs_user.get("id") and obs_user.get("id") not in users_set:
-                users_set.add(obs_user.get("id"))
-                all_observations.users.append(obs_user)
+            if obs_user.get("id") and obs_user.get("id") not in self.users_set:
+                self.users_set.add(obs_user.get("id"))
+                self.users.append(obs_user)
 
             # Add identifications
-            identifications, new_users = ObservationDownloader._unpack_identifications(
+            identifications, new_users = self._unpack_identifications(
                 observation.get("observation_id"),
                 result.get("identifications"),
-                users_set
+                self.users_set
             )
-            all_observations.users.extend(new_users)
-            all_observations.identifications.extend(identifications)
-
-        return users_set, obs_id_set
+            self.users.extend(new_users)
+            self.identifications.extend(identifications)
 
 
-    def filter_taxa(
-            self,
-            taxa_df: pd.DataFrame,
-    ) -> pd.DataFrame:
+    def is_max_reached(self, max_observations: int) -> bool:
         """
-        Helper function that returns a copy of the taxa dataframe filtered for only those that
-        need to be searched for.
+        Returns true if the number of observations is greater than `max_observations`, and false
+        otherwise
         """
-        df = taxa_df.copy()
+        # print(f"{len(self.observations)} > {max_observations} = {len(self.observations) > max_observations}")
+        return len(self.observations) > max_observations
 
-        # Filter out parent/genus level matches
-        match_type_mask = df["match_type"].isin(["exact", "override"])
-        match_df = df[match_type_mask]
 
-        # Apply date filter
-        filtered_df = self._apply_date_filter(match_df)
+    def update_completed_taxa(self, batch: list):
+        """Update set of completed taxa"""
+        self.completed_taxa.update(batch)
 
-        # Set stats
-        self.total_taxa_count = len(taxa_df)
-        self.undescribed_taxa_count = self.total_taxa_count - len(match_df)
-        self.filtered_taxa_count = len(filtered_df)
 
-        return filtered_df
+@dataclass
+class ObservationResultsClean():
+    """
+    Helper class that converts the working lists in a ResultsRaw object into validated dataframes.
+    * **observations**: DataFrame of iNaturalist observations.
+    * **identifications**: DataFrame of identifications for the returned observations.
+    * **users**: DataFrame of users, both observers and identifiers.
+    * **annotations**: All of the annotations left on the observations.
+    * **completed_taxa**: Set of taxon IDs for which all observations have been recieved.
+    """
+    observations       : pd.DataFrame = None
+    identifications    : pd.DataFrame = None
+    users              : pd.DataFrame = None
+    annotations        : pd.DataFrame = None
+    completed_taxa     : set = None
+
+    @staticmethod
+    def validate(obs: ObservationResultsRaw) -> Self | None:
+        """
+        Converts the observations results into dataframes and validates them. Use this instead of
+        the class constructor.
+        """
+        if len(obs.observations) == 0:
+            logger.warning("No results found.")
+            return None
+        
+        result = ObservationResultsClean()
+
+        result.observations = ObservationResultsClean._get_validated_df(
+            obs.observations,
+            ObservationSchema.from_raw
+        )
+        result.identifications = ObservationResultsClean._get_validated_df(
+            obs.identifications,
+            IdentificationsSchema.from_raw
+        )
+        result.users = ObservationResultsClean._get_validated_df(
+            obs.users,
+            UsersSchema.from_raw
+        )
+        result.annotations = ObservationResultsClean._get_validated_df(
+            obs.annotations,
+            AnnotationsSchema.validate
+        )
+        result.completed_taxa = obs.completed_taxa
+
+        return result
+
+    @staticmethod
+    def _get_validated_df(data: list, func):
+        if data is None or len(data) == 0:
+            return None
+        return func(pd.DataFrame(data))
+
+    def convert_all_to_sqlite(self) -> ObservationResultsRaw:
+        """
+        Converts each dataframe to a SQLite-friendly version, using the schema's to_sqlite
+        method if present.
+        """
+        if self.observations is None:
+            raise ValueError("No observations in results.")
+
+        result = ObservationResultsRaw()
+        result.observations = (
+            ObservationSchema
+            .to_sqlite(self.observations)
+            .to_dict(orient="records")
+        )
+        if self.identifications is not None:
+            result.identifications = (
+                IdentificationsSchema
+                .to_sqlite(self.identifications)
+                .to_dict(orient="records")
+            )
+        if self.users is not None:
+            result.users = self.users.to_dict(orient="records")
+
+        if self.annotations is not None:
+            result.annotations = self.annotations.to_dict(orient="records")
+
+        if self.completed_taxa is not None:
+            result.completed_taxa = self.completed_taxa
+
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Observation Downloader
+# ---------------------------------------------------------------------------
+class ObservationDownloader():
+    """
+    Responsible for the downloading observations from iNaturalist. Tracks download stats.
+    """
+    def __init__(self, cfg: config.ObservationsConfig, auth: INaturalistAuth):
+        self.auth: INaturalistAuth = auth
+        self.config: config.ObservationsConfig = cfg
+
+        # Stats
+        self.total_taxa_count       : int = 0
+        self.request_count          : int = 0
+        self.filtered_taxa_count    : int = 0
+        self.unfiltered_taxa_count  : int = 0
+        self.taxa_completed         : int = 0
+        self.max_reached            : bool = False
+
+        # Results
+        self.results: ObservationResultsClean = None
+
+    @staticmethod
+    def _get_batches(full_list: list, batch_size: int):
+        """Helper function to yield successive n-sized chunks from list"""
+        full_list.sort()
+        for i in range(0, len(full_list), batch_size):
+            yield full_list[i:i + batch_size]
+
+    @staticmethod
+    def _create_date_taxon_map(taxa_df: pd.DataFrame) -> dict[str: set]:
+        """
+        Creates a map that groups taxon_ids into sets with date_updated as the key.
+        Args:
+            taxa_df: 
+                Taxa dataframe to create a date map from
+        Returns:
+            Dictionary that maps a date string to a set of taxon IDs.
+        """
+        df = taxa_df.sort_values(by="taxon_id", ascending=True).copy()
+
+        # Convert date to string        
+        try:
+            df["date_updated"] = df["date_updated"].dt.strftime(DATE_FORMAT)
+        except AttributeError as ex:
+            raise AttributeError("date_updated field must be of type pd.Timestamp") from ex
+        except KeyError as ex:
+            raise KeyError("taxa_df must have date_updated field") from ex
+
+        date_taxon_map: dict = (
+            df
+            .groupby("date_updated")["taxon_id"]
+            .apply(set)
+            .to_dict()
+        )
+        date_taxon_map["None"] = (
+            set(df
+                .loc[df["date_updated"].isna(), "taxon_id"]
+                .sort_values(ascending=True)
+            )
+        )
+        return date_taxon_map
+
+    def _request_batch(self, ids: list, params: dict, headers: str) -> list:
+        """
+        Download iNaturalist observations for a list of ID. Adds to this object's request count.
+        Args:
+            ids:
+                List of taxon IDs to download observations for.
+            params:
+                Base HTTP request parameters.
+            headers:
+                HTTP authentication headers.
+        Returns:
+            A list of result dictionaries decoded from the HTTP response.
+        """
+        params["taxon_id"] = ",".join(str(id) for id in ids)
+        url = "https://api.inaturalist.org/v2/observations"
+
+        result, count = helpers.sliding_page_requests(url, params, headers)
+        self.request_count += count
+
+        return result
+
+    # def _apply_date_filter(self, df: pd.DataFrame) -> pd.DataFrame:
+    #     """
+    #     Filters the dataframe for taxa that were last updated more than update_days ago. If
+    #     update_days is zero or None, set all taxas' date_updated column to None.
+    #     """
+    #     df = df.copy()
+    #     # If days_updated is zero, update all taxa without a date filter.
+    #     if not self.config.update_after_days:
+    #         df["date_updated"] = None
+
+    #     # Filter for taxa queried more than days_updated before now
+    #     else:
+    #         target_date = dt.date.today() - dt.timedelta(days=self.config.update_after_days)
+    #         date_mask = pd.to_datetime(df["date_updated"]) <= pd.Timestamp(target_date)
+    #         df = df[(df["date_updated"].isna()) | date_mask]
+
+    #     return df
+
+    @staticmethod
+    def _get_fields_rison() -> str:
+        """
+        Helper function that reads the contents of the provided JSON file and returns a RISON
+        encoded string.
+        """
+        try:
+            with open(FIELDS_FILE_PATH, "r", encoding="latin-1") as fp:
+                fields_dict = json.load(fp)
+
+        except FileNotFoundError as ex:
+            raise ValueError(f"Fields JSON file not found: {FIELDS_FILE_PATH}") from ex
+
+        except json.JSONDecodeError as ex:
+            raise ValueError(f"Failed to parse fields JSON file: {FIELDS_FILE_PATH}") from ex
+
+        return prison.dumps(fields_dict)
 
     # Fetch Observations
     def fetch_observations(
             self,
-            taxa_df: pd.DataFrame
-    ) -> Optional[ObservationResults]:
+            taxa_df: DataFrame[INatTaxaSchema]
+    ) -> ObservationUnpacker:
         """
         Downloads observations of taxa in taxa_df from iNaturalist and structures the results
         into observations, identifications, users, and the set of taxa searched for.
@@ -383,15 +471,25 @@ class ObservationDownloader():
             auth:
                 iNaturalist authentication object with an active access token
             taxa_df:
-                Non-empty dataframe of iNaturalist taxa to search observations for.
+                Non-empty dataframe of iNaturalist taxa to search observations for. Must conform to
+                schemas.INatTaxaSchema.
         Returns:
             ObservationResults object.
         Raises:
             TypeError: If taxa_df is not a dataframe.
             ValueError: If taxa_df is an empty dataframe.
         """
+        # Ensure argument is a dataframe
         if not isinstance(taxa_df, pd.DataFrame):
-            raise TypeError("Argument must be a pandas DataFrame.")
+            raise TypeError("Argument must be a dataframe.")
+
+        # Validate dataframe
+        try:
+            INatTaxaSchema.validate(taxa_df)
+        except SchemaError as ex:
+            helpers.report_schema_error(ex)
+
+        # Make sure dataframe is not empty
         if len(taxa_df) == 0:
             raise ValueError("No taxa to download for.")
 
@@ -411,10 +509,8 @@ class ObservationDownloader():
         date_taxa_map = self._create_date_taxon_map(taxa_df)
 
         # Iterate through taxon IDs and run requests
-        all_observations    = ObservationResults()
-        users_set           = set()
-        obs_id_set          = set()
-        max_reached         = False
+        unpacker = ObservationUnpacker()
+        self.max_reached = False
 
         logger.debug("Base parameters:")
         for param, value in base_params.items():
@@ -437,126 +533,68 @@ class ObservationDownloader():
                 )
                 logger.debug("  Finished downloading %i results.", len(data))
 
-                # Unpack results into all_observations
-                users_set, obs_id_set = self._unpack_results(
-                    data, all_observations, users_set, obs_id_set
-                )
+                unpacker.unpack_results(data)
+                unpacker.update_completed_taxa(batch)
+                self.max_reached = unpacker.is_max_reached(self.config.max_observations)
 
-                # Update set of completed taxa
-                all_observations.completed_taxa.update(batch)
-
-                if len(all_observations.observations) > self.config.max_observations:
-                    max_reached = True
+                if self.max_reached:
                     break
 
-            if max_reached:
+            if self.max_reached:
                 break
 
-        self.exceeded_download_max = max_reached
-        self.taxa_completed = len(all_observations.completed_taxa)
-        self.taxa_remaining = self.filtered_taxa_count - self.taxa_completed
+        self.taxa_completed = len(unpacker.completed_taxa)
 
-        return all_observations
+        return unpacker
 
 
-# ---------------------------------------------------------------------------
-# Observation Results Validator
-# ---------------------------------------------------------------------------
-class ObservationResultsValidator:
-    """
-    Helper class that converts the dataframes in an ObservationResults object (from the observations 
-    module) into validated dataframes, then into sqlite-friendly formats.
-    """
-    def __init__(self):
+    def run(self, taxa_df: DataFrame[INatTaxaSchema]):
         """
-        Just creates an empty validator. Avoid using this, instead use the <code>validate</code> 
-        static method to create an object from ObservationResults.
+        Download observations for the given taxa. Performs iNaturalist API requests, unpacks and
+        validates results.
         """
-        self.observations       : pd.DataFrame = None
-        self.identifications    : pd.DataFrame = None
-        self.users              : pd.DataFrame = None
-        self.annotations        : pd.DataFrame = None
-        self.completed_taxa     : set = None
+        # Validate taxa schema
+        try:
+            validated_df = INatTaxaSchema.validate(taxa_df)
+        except SchemaError as ex:
+            helpers.report_schema_error(ex)
 
+        # Filter out parent/genus level matches
+        match_df = INatTaxaSchema.filter_match_type(validated_df)
 
-    def to_sqlite(self) -> ObservationResults:
-        """
-        Converts each dataframe to a SQLite-friendly version, using the schema's to_sqlite
-        method if present.
-        """
-        if self.observations is None:
-            raise ValueError("No observations in results.")
-
-        result = ObservationResults()
-        result.observations = (
-            validation.ObservationSchema
-            .to_sqlite(self.observations)
-            .to_dict(orient="records")
+        # Apply date filter
+        filtered_df = INatTaxaSchema.apply_date_filter(
+            match_df, self.config.update_after_days, dt.date.today()
         )
-        if self.identifications is not None:
-            result.identifications = (
-                validation.IdentificationsSchema
-                .to_sqlite(self.identifications)
-                .to_dict(orient="records")
-            )
-        if self.users is not None:
-            result.users = self.users.to_dict(orient="records")
 
-        if self.annotations is not None:
-            result.annotations = self.annotations.to_dict(orient="records")
-
-        if self.completed_taxa is not None:
-            result.completed_taxa = self.completed_taxa
-
-        return result
-
-
-    @staticmethod
-    def validate(obs: ObservationResults) -> Self:
-        """
-        Initializes and populates an ObservationResultsClean object with validated dataframes from
-        the provided ObservationResults object. 
-        """
-        result = ObservationResultsValidator()
-        result.observations = (
-            result.get_validated_df(
-                obs.observations,
-                validation.ObservationSchema.from_raw
-            )
-        )
-        result.identifications = (
-            result.get_validated_df(
-                obs.identifications,
-                validation.IdentificationsSchema.from_raw
-            )
-        )
-        result.users = (
-            result.get_validated_df(
-                obs.users,
-                validation.UsersSchema.from_raw
-            )
-        )
-        result.annotations = (
-            result.get_validated_df(
-                obs.annotations,
-                validation.AnnotationsSchema.validate
-            )
-        )
-        result.completed_taxa = obs.completed_taxa
-        return result
-
-
-    @staticmethod
-    def get_validated_df(df, func, kwargs = None) -> pd.DataFrame:
-        """
-        Helper function that applies the given validation function to the dataframe using the 
-        arguments in kwargs.
-        """
-        if not kwargs:
-            kwargs = {}
-
-        if df is None or len(df) == 0:
-            return None
-
-        return func(pd.DataFrame(df), **kwargs)
+        # Set stats
+        self.total_taxa_count = len(validated_df)
+        self.non_exact_match_count = self.total_taxa_count - len(match_df)
+        self.filtered_taxa_count = len(filtered_df)
     
+        # Check if there are actually taxa to be searched for
+        if len(filtered_df) == 0:
+            logger.warning("No taxa left to download observations for. " +
+                "All taxa are either undescribed or have been updated less than %s days ago.",
+                self.config.update_after_days)
+            return None
+    
+        logger.info("* Total taxa with iNaturalist mapping: %i", self.total_taxa_count)
+        logger.info("* Non-exact matches (will be skipped when downloading): %i",
+            self.non_exact_match_count)
+        logger.info("* Number of taxa to be updated: %i", self.filtered_taxa_count)
+        logger.info("")
+    
+        # Download
+        unpacked_results = self.fetch_observations(filtered_df)
+        self.taxa_remaining = self.filtered_taxa_count - self.taxa_completed
+    
+        # Validate
+        try:
+            self.results = ObservationResultsClean.validate(unpacked_results)
+        except SchemaError as ex:
+            raise ValueError("Results of observations query don't fit the expected schema.") from ex
+        except ValueError as ex:
+            raise ValueError("Unexpected exception while structuring observation data.") from ex
+
+        return self.results

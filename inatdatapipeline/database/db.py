@@ -13,8 +13,7 @@ import numpy as np
 from pandas.api.typing import NAType
 import arcpy
 from inatdatapipeline.client import (
-    observations,
-    annotations
+    observations
 )
 
 sqlite3.register_adapter(dt.date, lambda d: d.isoformat())
@@ -668,7 +667,7 @@ class DBManager:
             raise
 
 
-    def update_annotations(self, ann: annotations.AnnotationOptions) -> int:
+    def update_annotations(self, categories: list[dict], values: list[dict]) -> int:
         """
         Makes sure all three annotations tables are set up, then inserts the annotations and
         annotation values into the database.
@@ -686,14 +685,14 @@ class DBManager:
             """
         ]
         with closing(self._conn.cursor()) as cursor:
-            cursor.executemany(statements[0], ann.categories)
-            cursor.executemany(statements[1], ann.values)
+            cursor.executemany(statements[0], categories)
+            cursor.executemany(statements[1], values)
             count = cursor.rowcount
 
         return count
 
 
-    def insert_observation_results(self, results: observations.ObservationResults):
+    def insert_observation_results(self, results: observations.ObservationResultsClean):
         """
         Helper function that inserts all observations from API request into the database.
 

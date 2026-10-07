@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS tracking_taxa (
     sci_name              text    NOT NULL,
     global_sci_name       text    NOT NULL,
     override_name         text,
-    classification_level  text    NOT NULL,
+    classification_level  text    CHECK (classification_level IN ('Species', 'Variety', 'Subspecies', 'Population')) NOT NULL,
     is_described          boolean CHECK (is_described IN (NULL, true, false)) NOT NULL,
     parent_egt_id         int     REFERENCES parent_taxa(parent_egt_id) ON DELETE CASCADE,
     element_type          text,

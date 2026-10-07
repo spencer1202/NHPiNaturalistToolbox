@@ -1,5 +1,4 @@
 from pathlib import Path
-from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 import sqlite3
 import shutil
@@ -7,33 +6,17 @@ import shutil
 import pandas as pd
 import pytest
 
-from inatdatapipeline import pipeline
+from inatdatapipeline import config, pipeline
 from inatdatapipeline.database.db import DBManager
-from inatdatapipeline.client.observations import ObservationResults
-from inatdatapipeline.client import annotations, taxa
-from inatdatapipeline.schemas import config, validation
+from inatdatapipeline.client.observations import ObservationResultsClean
+from inatdatapipeline.client import taxa
+from inatdatapipeline import schemas
 
-SCHEMA_SQL = Path(__file__).resolve().parents[1] / "inatdatapipeline" / "schema.sql"
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 # ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def db_manager(tmp_path):
-    db_path = tmp_path / "taxa_integration.gpkg"
-    manager = DBManager(str(db_path))
-    manager.connect()
-    manager.setup_db(str(SCHEMA_SQL))
-    yield manager
-    if manager._conn is not None:
-        manager._conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Taxa
-# ---------------------------------------------------------------------------
+# Fixtures and helpers
+# ---inatdatapipeline.schemas--------------------------------------------------------
 class FakeTaxonMappingBuilder(taxa.TaxonMappingBuilder):
     """
     Subclasses the real TaxonMappingBuilder so every part of the real pipeline runs
@@ -60,336 +43,6 @@ class FakeTaxonMappingBuilder(taxa.TaxonMappingBuilder):
             return self.FAKE_ID_RESULTS.get(override_id)
         return self.FAKE_RESULTS.get(search_name)
 
-        
-class TestTaxa:
-    @staticmethod
-    def _write_tracking_csv(path: Path):
-        pd.DataFrame(
-            [
-                {
-                    "est_id": 101,
-                    "egt_id": 5001,
-                    "sci_name": "Carex stipata",
-                    "global_sci_name": "Carex stipata",
-                    "classification_level": "Species",
-                    "parent_egt_id": None,
-                    "parent_sci_name": None,
-                    "element_type": "Plant",
-                    "scomname": "owlfruit sedge",
-                    "family": "Cyperaceae",
-                    "genus_egt_id": 201,
-                    "genus": "Carex",
-                    "author": "Muhlenberg ex Willdenow",
-                    "egt_uid": "EGT-001",
-                    "s_rank": "S5",
-                    "eo_track_status_desc": "Tracked",
-                    "explorer": "https://example.org/explorer/carex-stipata",
-                    "elcode_bcd": "ABNAB",
-                    "name_category_desc": "Vascular plant",
-                    "growth_habit": "Sedge",
-                    "duration": "Perennial",
-                },
-                {
-                    "est_id": 102,
-                    "egt_id": 5002,
-                    "sci_name": "Aster amellus",
-                    "global_sci_name": "Aster amellus",
-                    "classification_level": "Species",
-                    "parent_egt_id": None,
-                    "parent_sci_name": None,
-                    "element_type": "Plant",
-                    "scomname": "European starwort",
-                    "family": "Asteraceae",
-                    "genus_egt_id": 202,
-                    "genus": "Aster",
-                    "author": "L.",
-                    "egt_uid": "EGT-002",
-                    "s_rank": "S4",
-                    "eo_track_status_desc": "Tracked",
-                    "explorer": "https://example.org/explorer/aster-amellus",
-                    "elcode_bcd": "ABNAB",
-                    "name_category_desc": "Vascular plant",
-                    "growth_habit": "Forb",
-                    "duration": "Perennial",
-                },
-                {
-                    "est_id": 103,
-                    "egt_id": 5003,
-                    "sci_name": "Nuphar advena",
-                    "global_sci_name": "Nuphar advena",
-                    "classification_level": "Species",
-                    "parent_egt_id": None,
-                    "parent_sci_name": None,
-                    "element_type": "Plant",
-                    "scomname": "spadderdock",
-                    "family": "Nymphaeaceae",
-                    "genus_egt_id": 203,
-                    "genus": "Nuphar",
-                    "author": "Aiton",
-                    "egt_uid": "EGT-003",
-                    "s_rank": "S5",
-                    "eo_track_status_desc": "Tracked",
-                    "explorer": "https://example.org/explorer/nuphar-advena",
-                    "elcode_bcd": "ABNAB",
-                    "name_category_desc": "Vascular plant",
-                    "growth_habit": "Aquatic",
-                    "duration": "Perennial",
-                },
-            ]
-        ).to_csv(path, index=False)
-
-
-    @staticmethod
-    def _write_overrides_csv(path: Path):
-        pd.DataFrame(
-            [
-                {
-                    "est_id": 101,
-                    "inat_name": "Carex stipata",
-                    "taxon_id": 12345,
-                },
-                {
-                    "est_id": 102,
-                    "inat_name": "Aster amellus",
-                    "taxon_id": 67890,
-                },
-            ]
-        ).to_csv(path, index=False)
-
-
-    def test_build_taxon_mapping_end_to_end_with_patched_api(self, db_manager, tmp_path):
-        tracking_file = tmp_path / "tracking.csv"
-        overrides_file = tmp_path / "overrides.csv"
-
-        shutil.copy(FIXTURES_DIR / "tracking_scenarios.csv", tracking_file)
-        shutil.copy(FIXTURES_DIR / "overrides_scenarios.csv", overrides_file)
-
-        auth = MagicMock()
-
-        with patch.object(pipeline.taxa, "TaxonMappingBuilder", FakeTaxonMappingBuilder):
-            pipeline.build_taxon_mapping(
-                str(tracking_file),
-                str(overrides_file),
-                db_manager,
-                auth,
-                rebuild=True,
-            )
-
-        with db_manager as conn:
-            tracking_rows = conn.select("tracking_taxa")
-            rel_rows = conn.select("tracking_rel")
-
-        assert len(tracking_rows) == 6
-        assert set(tracking_rows["est_id"]) == {101, 102, 103, 104, 105, 106}
-
-        rel_by_est = rel_rows.set_index("est_id")["taxon_id"].dropna().to_dict() if "est_id" in rel_rows else {}
-
-        # 101/102: override-driven matches
-        est_rel = rel_rows.dropna(subset=["est_id"]).set_index("est_id")["taxon_id"].to_dict()
-        assert est_rel[101] == 12345
-        assert est_rel[102] == 67890
-
-        # 104: undescribed species, matched via genus fallback
-        genus_rel = rel_rows.dropna(subset=["genus_egt_id"]).set_index("genus_egt_id")["taxon_id"].to_dict()
-        assert genus_rel[204] == 55501
-
-        # 105: undescribed subspecies, matched via parent fallback
-        parent_rel = rel_rows.dropna(subset=["parent_egt_id"]).set_index("parent_egt_id")["taxon_id"].to_dict()
-        assert parent_rel[5005] == 55502
-
-        # 106: described, no match anywhere - no tracking_rel row references it at all
-        assert 106 not in est_rel
-        assert 5006 not in parent_rel
-        assert 206 not in genus_rel
-
-
-
-    def test_build_taxon_mapping_skips_existing_mappings_when_rebuild_is_false(self, db_manager, tmp_path):
-        tracking_file = tmp_path / "tracking.csv"
-        overrides_file = tmp_path / "overrides.csv"
-
-        self._write_tracking_csv(tracking_file)
-        self._write_overrides_csv(overrides_file)
-
-        auth = MagicMock()
-
-        # Seed an existing mapping so build_taxon_mapping() should skip it.
-        with db_manager as conn:
-            conn._conn.execute(
-                """
-                INSERT INTO inat_taxa (taxon_id, inat_name)
-                VALUES (?, ?)
-                """,
-                (99999, "Nuphar advena"),
-            )
-            conn._conn.execute(
-                """
-                INSERT INTO tracking_rel (est_id, taxon_id)
-                VALUES (?, ?)
-                """,
-                (103, 99999),
-            )
-            conn._conn.commit()
-
-        with patch.object(pipeline.taxa, "TaxonMappingBuilder", FakeTaxonMappingBuilder):
-            pipeline.build_taxon_mapping(
-                str(tracking_file),
-                str(overrides_file),
-                db_manager,
-                auth,
-                rebuild=False,
-            )
-
-        with db_manager as conn:
-            rel_rows = conn.select("tracking_rel")
-
-        rel_by_est = rel_rows.set_index("est_id")["taxon_id"].to_dict()
-
-        assert rel_by_est[103] == 99999
-        assert 101 in rel_by_est
-        assert 102 in rel_by_est
-
-
-    def test_build_taxon_mapping_rebuild_true_remaps_all_rows(self, db_manager, tmp_path):
-        tracking_file = tmp_path / "tracking.csv"
-        overrides_file = tmp_path / "overrides.csv"
-
-        self._write_tracking_csv(tracking_file)
-        self._write_overrides_csv(overrides_file)
-
-        auth = MagicMock()
-
-        # Seed some stale mapping values.
-        with db_manager as conn:
-            conn._conn.execute(
-                """
-                INSERT INTO inat_taxa (taxon_id, inat_name)
-                VALUES (?, ?)
-                """,
-                (11111, "Old taxon"),
-            )
-            conn._conn.execute(
-                """
-                INSERT INTO tracking_rel (est_id, taxon_id)
-                VALUES (?, ?)
-                """,
-                (101, 11111),
-            )
-            conn._conn.commit()
-
-        with patch.object(pipeline.taxa, "TaxonMappingBuilder", FakeTaxonMappingBuilder):
-            pipeline.build_taxon_mapping(
-                str(tracking_file),
-                str(overrides_file),
-                db_manager,
-                auth,
-                rebuild=True,
-            )
-
-        with db_manager as conn:
-            rel_rows = conn.select("tracking_rel")
-
-        rel_by_est = rel_rows.set_index("est_id")["taxon_id"].to_dict()
-        assert rel_by_est[101] == 12345
-        assert rel_by_est[102] == 67890
-        assert rel_by_est[103] == 99999
-
-
-    def test_build_taxon_mapping_noop_when_everything_is_already_mapped(self, db_manager, tmp_path):
-        tracking_file = tmp_path / "tracking.csv"
-        overrides_file = tmp_path / "overrides.csv"
-
-        self._write_tracking_csv(tracking_file)
-        self._write_overrides_csv(overrides_file)
-
-        auth = MagicMock()
-
-        with db_manager as conn:
-            conn._conn.execute(
-                """
-                INSERT INTO inat_taxa (taxon_id, inat_name)
-                VALUES (?, ?)
-                """,
-                (12345, "Carex stipata"),
-            )
-            conn._conn.execute(
-                """
-                INSERT INTO inat_taxa (taxon_id, inat_name)
-                VALUES (?, ?)
-                """,
-                (67890, "Aster amellus"),
-            )
-            conn._conn.execute(
-                """
-                INSERT INTO inat_taxa (taxon_id, inat_name)
-                VALUES (?, ?)
-                """,
-                (99999, "Nuphar advena"),
-            )
-
-            conn._conn.execute(
-                """
-                INSERT INTO tracking_rel (est_id, taxon_id)
-                VALUES (?, ?)
-                """,
-                (101, 12345),
-            )
-            conn._conn.execute(
-                """
-                INSERT INTO tracking_rel (est_id, taxon_id)
-                VALUES (?, ?)
-                """,
-                (102, 67890),
-            )
-            conn._conn.execute(
-                """
-                INSERT INTO tracking_rel (est_id, taxon_id)
-                VALUES (?, ?)
-                """,
-                (103, 99999),
-            )
-            conn._conn.commit()
-
-        with patch.object(pipeline.taxa, "TaxonMappingBuilder", FakeTaxonMappingBuilder):
-            pipeline.build_taxon_mapping(
-                str(tracking_file),
-                str(overrides_file),
-                db_manager,
-                auth,
-                rebuild=False,
-            )
-
-        with db_manager as conn:
-            rel_rows = conn.select("tracking_rel")
-
-        assert len(rel_rows) == 3
-        assert set(rel_rows["est_id"]) == {101, 102, 103}
-
-    ### Negative cases ###
-    def test_build_taxon_mapping_raises_value_error_for_invalid_tracking_csv(self, db_manager, tmp_path):
-        tracking_file = tmp_path / "bad_tracking.csv"
-        overrides_file = tmp_path / "overrides.csv"
-
-        pd.DataFrame([{"not_a_valid_tracking_column": "Carex stipata"}]).to_csv(tracking_file, index=False)
-        pd.DataFrame([{"est_id": 101, "inat_name": "Carex stipata", "taxon_id": 12345}]).to_csv(
-            overrides_file, index=False
-        )
-
-        auth = MagicMock()
-
-        with pytest.raises(ValueError, match="tracking|validation|schema|failed"):
-            pipeline.build_taxon_mapping(
-                str(tracking_file),
-                str(overrides_file),
-                db_manager,
-                auth,
-                rebuild=False,
-            )
-
-
-# ---------------------------------------------------------------------------
-# Observations
-# ---------------------------------------------------------------------------
 @pytest.fixture
 def cfg_obs():
     return config.ObservationsConfig(
@@ -455,15 +108,335 @@ def _fake_request_batch(observations_by_taxon: dict):
     return _request_batch
 
 
-class TestObservations:
+# ---------------------------------------------------------------------------
+# Taxa
+# ---------------------------------------------------------------------------
+class TestTaxa:
+    @staticmethod
+    def _write_tracking_csv(path: Path):
+        pd.DataFrame(
+            [
+                {
+                    "est_id": 101,
+                    "egt_id": 5001,
+                    "sci_name": "Carex stipata",
+                    "global_sci_name": "Carex stipata",
+                    "classification_level": "Species",
+                    "parent_egt_id": None,
+                    "parent_sci_name": None,
+                    "element_type": "Plant",
+                    "common_name": "owlfruit sedge",
+                    "family": "Cyperaceae",
+                    "genus_egt_id": 201,
+                    "genus_sci_name": "Carex",
+                    "author": "Muhlenberg ex Willdenow",
+                    "egt_uid": "EGT-001",
+                    "srank": "S5",
+                    "track_status": "Tracked",
+                    "explorer": "https://example.org/explorer/carex-stipata",
+                    "elcode": "ABNAB",
+                    "name_category_desc": "Vascular plant",
+                    "growth_habit": "Sedge",
+                    "duration": "Perennial",
+                },
+                {
+                    "est_id": 102,
+                    "egt_id": 5002,
+                    "sci_name": "Aster amellus",
+                    "global_sci_name": "Aster amellus",
+                    "classification_level": "Species",
+                    "parent_egt_id": None,
+                    "parent_sci_name": None,
+                    "element_type": "Plant",
+                    "common_name": "European starwort",
+                    "family": "Asteraceae",
+                    "genus_egt_id": 202,
+                    "genus_sci_name": "Aster",
+                    "author": "L.",
+                    "egt_uid": "EGT-002",
+                    "srank": "S4",
+                    "track_status": "Tracked",
+                    "explorer": "https://example.org/explorer/aster-amellus",
+                    "elcode": "ABNAB",
+                    "name_category_desc": "Vascular plant",
+                    "growth_habit": "Forb",
+                    "duration": "Perennial",
+                },
+                {
+                    "est_id": 103,
+                    "egt_id": 5003,
+                    "sci_name": "Nuphar advena",
+                    "global_sci_name": "Nuphar advena",
+                    "classification_level": "Species",
+                    "parent_egt_id": None,
+                    "parent_sci_name": None,
+                    "element_type": "Plant",
+                    "common_name": "spadderdock",
+                    "family": "Nymphaeaceae",
+                    "genus_egt_id": 203,
+                    "genus_sci_name": "Nuphar",
+                    "author": "Aiton",
+                    "egt_uid": "EGT-003",
+                    "srank": "S5",
+                    "track_status": "Tracked",
+                    "explorer": "https://example.org/explorer/nuphar-advena",
+                    "elcode": "ABNAB",
+                    "name_category_desc": "Vascular plant",
+                    "growth_habit": "Aquatic",
+                    "duration": "Perennial",
+                },
+            ]
+        ).to_csv(path, index=False)
 
+
+    @staticmethod
+    def _write_overrides_csv(path: Path):
+        pd.DataFrame(
+            [
+                {
+                    "est_id": 101,
+                    "inat_name": "Carex stipata",
+                    "taxon_id": 12345,
+                },
+                {
+                    "est_id": 102,
+                    "inat_name": "Aster amellus",
+                    "taxon_id": 67890,
+                },
+            ]
+        ).to_csv(path, index=False)
+
+
+    def test_build_taxon_mapping_end_to_end_with_patched_api(self, db_manager, tmp_path):
+        tracking_file = tmp_path / "tracking.csv"
+        overrides_file = tmp_path / "overrides.csv"
+
+        shutil.copy(FIXTURES_DIR / "tracking_scenarios.csv", tracking_file)
+        shutil.copy(FIXTURES_DIR / "overrides_scenarios.csv", overrides_file)
+
+        auth = MagicMock()
+        cfg = config.TaxaConfig(rebuild=True)
+
+        with patch.object(pipeline.taxa, "TaxonMappingBuilder", FakeTaxonMappingBuilder):
+            pipeline.build_taxon_mapping(
+                str(tracking_file),
+                str(overrides_file),
+                cfg,
+                db_manager,
+                auth,
+            )
+
+        with db_manager as conn:
+            tracking_rows = conn.select("tracking_taxa")
+            rel_rows = conn.select("tracking_rel")
+
+        assert len(tracking_rows) == 6
+        assert set(tracking_rows["est_id"]) == {101, 102, 103, 104, 105, 106}
+
+        # 101/102: override-driven matches
+        est_rel = rel_rows.dropna(subset=["est_id"]).set_index("est_id")["taxon_id"].to_dict()
+        assert est_rel[101] == 12345
+        assert est_rel[102] == 67890
+
+        # 104: undescribed species, matched via genus fallback
+        genus_rel = rel_rows.dropna(subset=["genus_egt_id"]).set_index("genus_egt_id")["taxon_id"].to_dict()
+        assert genus_rel[204] == 55501
+
+        # 105: undescribed subspecies, matched via parent fallback
+        parent_rel = rel_rows.dropna(subset=["parent_egt_id"]).set_index("parent_egt_id")["taxon_id"].to_dict()
+        assert parent_rel[5005] == 55502
+
+        # 106: described, no match anywhere - no tracking_rel row references it at all
+        assert 106 not in est_rel
+        assert 5006 not in parent_rel
+        assert 206 not in genus_rel
+
+
+
+    def test_build_taxon_mapping_skips_existing_mappings_when_rebuild_is_false(self, db_manager, tmp_path):
+        tracking_file = tmp_path / "tracking.csv"
+        overrides_file = tmp_path / "overrides.csv"
+
+        self._write_tracking_csv(tracking_file)
+        self._write_overrides_csv(overrides_file)
+
+        auth = MagicMock()
+        cfg = config.TaxaConfig(rebuild=False)
+
+        # Seed an existing mapping so build_taxon_mapping() should skip it.
+        with db_manager as conn:
+            conn._conn.execute(
+                """
+                INSERT INTO inat_taxa (taxon_id, inat_name)
+                VALUES (?, ?)
+                """,
+                (99999, "Nuphar advena"),
+            )
+            conn._conn.execute(
+                """
+                INSERT INTO tracking_rel (est_id, taxon_id)
+                VALUES (?, ?)
+                """,
+                (103, 99999),
+            )
+            conn._conn.execute(
+                """
+                INSERT INTO tracking_taxa (est_id, egt_id, sci_name, global_sci_name, classification_level, is_described, genus_egt_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (103, 1111, "Nuphar advena", "Nuphar advena", "Species", True, 5555)
+            )
+            conn._conn.commit()
+
+        with patch.object(pipeline.taxa, "TaxonMappingBuilder", FakeTaxonMappingBuilder):
+            pipeline.build_taxon_mapping(
+                str(tracking_file),
+                str(overrides_file),
+                cfg,
+                db_manager,
+                auth
+            )
+
+        with db_manager as conn:
+            rel_rows = conn.select("tracking_rel")
+
+        rel_by_est = rel_rows.set_index("est_id")["taxon_id"].to_dict()
+
+        assert rel_by_est[103] == 99999
+        assert 101 in rel_by_est
+        assert 102 in rel_by_est
+
+
+    def test_build_taxon_mapping_rebuild_true_remaps_all_rows(self, db_manager, tmp_path):
+        tracking_file = tmp_path / "tracking.csv"
+        overrides_file = tmp_path / "overrides.csv"
+
+        self._write_tracking_csv(tracking_file)
+        self._write_overrides_csv(overrides_file)
+
+        auth = MagicMock()
+        cfg = config.TaxaConfig(rebuild=True)
+
+        # Seed some stale mapping values.
+        with db_manager as conn:
+            conn._conn.execute(
+                """
+                INSERT INTO inat_taxa (taxon_id, inat_name)
+                VALUES (?, ?)
+                """,
+                (11111, "Old taxon"),
+            )
+            conn._conn.execute(
+                """
+                INSERT INTO tracking_rel (est_id, taxon_id)
+                VALUES (?, ?)
+                """,
+                (101, 11111),
+            )
+            conn._conn.commit()
+
+        with patch.object(pipeline.taxa, "TaxonMappingBuilder", FakeTaxonMappingBuilder):
+            pipeline.build_taxon_mapping(
+                str(tracking_file),
+                str(overrides_file),
+                cfg,
+                db_manager,
+                auth,
+            )
+
+        with db_manager as conn:
+            rel_rows = conn.select("tracking_rel")
+
+        rel_by_est = rel_rows.set_index("est_id")["taxon_id"].to_dict()
+        assert rel_by_est[101] == 12345
+        assert rel_by_est[102] == 67890
+        assert rel_by_est[103] == 99999
+
+
+    def test_build_taxon_mapping_noop_when_everything_is_already_mapped(self, db_manager, tmp_path):
+        tracking_file = tmp_path / "tracking.csv"
+        overrides_file = tmp_path / "overrides.csv"
+
+        self._write_tracking_csv(tracking_file)
+        self._write_overrides_csv(overrides_file)
+
+        auth = MagicMock()
+        cfg = config.TaxaConfig(rebuild=False)
+
+        with db_manager as conn:
+            conn._conn.execute(
+                """
+                INSERT INTO inat_taxa (taxon_id, inat_name)
+                VALUES (?, ?), (?, ?), (?, ?)
+                """,
+                (12345, "Carex stipata", 67890, "Aster amellus", 99999, "Nuphar advena"),
+            )
+            conn._conn.execute(
+                """
+                INSERT INTO tracking_rel (est_id, taxon_id)
+                VALUES (?, ?), (?, ?), (?, ?)
+                """,
+                (101, 12345, 102, 67890, 103, 99999),
+            )
+            conn._conn.execute(
+                """
+                INSERT INTO tracking_taxa (est_id, egt_id, sci_name, global_sci_name, classification_level, is_described, genus_egt_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    101, 11111, "Carex stipata", "Carex stipata", "Species", True, 5555,
+                    102, 22222, "Aster amellus", "Aster amellus", "Species", True, 6666,
+                    103, 33333, "Nuphar advena", "Nuphar advena", "Species", True, 7777
+                )
+            )
+            conn._conn.commit()
+
+        with patch.object(pipeline.taxa, "TaxonMappingBuilder", FakeTaxonMappingBuilder):
+            pipeline.build_taxon_mapping(
+                str(tracking_file),
+                str(overrides_file),
+                cfg,
+                db_manager,
+                auth
+            )
+
+        with db_manager as conn:
+            rel_rows = conn.select("tracking_rel")
+
+        assert len(rel_rows) == 3
+        assert set(rel_rows["est_id"]) == {101, 102, 103}
+
+    ### Negative cases ###
+    def test_build_taxon_mapping_raises_value_error_for_invalid_tracking_csv(self, db_manager, tmp_path):
+        tracking_file = tmp_path / "bad_tracking.csv"
+        overrides_file = tmp_path / "overrides.csv"
+
+        pd.DataFrame([{"not_a_valid_tracking_column": "Carex stipata"}]).to_csv(tracking_file, index=False)
+        pd.DataFrame([{"est_id": 101, "inat_name": "Carex stipata", "taxon_id": 12345}]).to_csv(
+            overrides_file, index=False
+        )
+
+        auth = MagicMock()
+        cfg = config.TaxaConfig(rebuild=False)
+        with pytest.raises(ValueError, match="[Tt]racking|[Vv]alidation|[Ss]chema|[Ff]ailed"):
+            pipeline.build_taxon_mapping(
+                str(tracking_file),
+                str(overrides_file),
+                cfg,
+                db_manager,
+                auth
+            )
+
+
+# ---------------------------------------------------------------------------
+# Observations
+# ---------------------------------------------------------------------------
+class TestObservations:
     @staticmethod
     def _seed_real_mapping(db_manager, rows):
         """
         Seeds tracking_taxa, genera, parent_taxa (as needed), inat_taxa, and tracking_rel
-        directly against the real schema, so the real `mappings` view - and therefore the
-        real ObservationDownloader.filter_taxa - sees accurate match_type/is_described
-        values instead of anything hand-computed by a fake.
+        directly against the real schema.
 
         Each row dict needs: est_id, taxon_id, sci_name, common_name, inat_name, elcode,
         growth_habit, is_described, genus_egt_id, and match_level
@@ -690,28 +663,13 @@ class TestObservations:
 # Update Annotations
 # ---------------------------------------------------------------------------
 class TestUpdateAnnotations:
-
-    class FakeAnnotationOptions:
-        def __init__(self):
-            self.categories = [
-                {"annotation_id": 1, "label": "Life Stage"},
-                {"annotation_id": 2, "label": "Plant Phenology"},
-            ]
-            self.values = [
-                {"value_id": 1, "annotation_id": 1, "label": "Adult"},
-                {"value_id": 2, "annotation_id": 1, "label": "Juvenile"},
-                {"value_id": 3, "annotation_id": 2, "label": "Flowering"},
-                {"value_id": 4, "annotation_id": 2, "label": "Fruiting"},
-            ]
-
-
-    def test_update_annotations_inserts_annotation_options(self, db_manager):
+    def test_update_annotations_inserts_annotation_options(self, db_manager, annotation_results):
         auth = MagicMock()
 
         with patch.object(
-            pipeline.annotations,
+            pipeline.helpers,
             "fetch_annotations",
-            return_value=self.FakeAnnotationOptions(),
+            return_value=annotation_results
         ):
             pipeline.update_annotations(db_manager, auth)
 
@@ -727,20 +685,20 @@ class TestUpdateAnnotations:
         auth = MagicMock()
 
         with patch.object(
-            pipeline.annotations,
+            pipeline.helpers,
             "fetch_annotations",
             side_effect=ValueError("network failure"),
         ):
             with pytest.raises(ValueError, match="Network exception occurred while requesting annotations"):
                 pipeline.update_annotations(db_manager, auth)
 
-    def test_update_annotations_raises_value_error_on_db_error(self, db_manager):
+    def test_update_annotations_raises_value_error_on_db_error(self, db_manager, annotation_results):
         auth = MagicMock()
 
         with patch.object(
-            pipeline.annotations,
+            pipeline.helpers,
             "fetch_annotations",
-            return_value=TestUpdateAnnotations.FakeAnnotationOptions(),
+            return_value=annotation_results,
         ):
             with patch.object(
                 DBManager,
@@ -797,7 +755,9 @@ class TestUpdateProjectMembers:
                 with pytest.raises(ValueError):
                     pipeline.update_project_members(247148, db_manager, auth)
 
-
+# ---------------------------------------------------------------------------
+# Review
+# ---------------------------------------------------------------------------
 class TestReview:
     @staticmethod
     def _seed_review_inputs(db_manager: DBManager):
@@ -806,18 +766,17 @@ class TestReview:
             conn.replace_project_members([1, 2])
 
         # Update annotation options
-        ann_opts = annotations.AnnotationOptions(
-            categories=[
-                {"annotation_id": 1, "label": "Life Stage"},
-                {"annotation_id": 2, "label": "Phenology"},
-            ],
-            values=[
-                {"value_id": 1, "annotation_id": 1, "label": "Adult"},
-                {"value_id": 2, "annotation_id": 2, "label": "Flowering"},
-            ],
-        )
+        categories = [
+            {"annotation_id": 1, "label": "Life Stage"},
+            {"annotation_id": 2, "label": "Phenology"},
+        ]
+        values = [
+            {"value_id": 1, "annotation_id": 1, "label": "Adult"},
+            {"value_id": 2, "annotation_id": 2, "label": "Flowering"},
+        ]
+    
         with db_manager as conn:
-            conn.update_annotations(ann_opts)
+            conn.update_annotations(categories, values)
 
         # Insert taxa
         with db_manager as conn:
@@ -854,7 +813,7 @@ class TestReview:
             conn._conn.commit()
 
         # Seed observations (unchanged)
-        raw_result = ObservationResults(
+        raw_result = ObservationResultsClean(
             observations=[
                 {
                     "observation_id": 101, "uuid": "uuid-101", "observer_id": 1, "taxon_id": 10,
@@ -875,8 +834,8 @@ class TestReview:
             completed_taxa={10},
         )
 
-        validated = pipeline.observations.ObservationResultsValidator.validate(raw_result)
-        db_manager.insert_observation_results(validated.to_sqlite())
+        validated = pipeline.observations.ObservationResultsClean.validate(raw_result)
+        db_manager.insert_observation_results(validated.convert_all_to_sqlite())
 
 
     def test_update_experts_inserts_rows(self, db_manager, tmp_path):
@@ -885,20 +844,20 @@ class TestReview:
         pd.DataFrame(
             [
                 {
-                    validation.EXPERTS_INAT_ID_FIELD: 1001,
-                    validation.EXPERTS_EXPERTISE_FIELD: "Plant",
+                    config.EXPERTS_FIELD_INAT_ID: 1001,
+                    config.EXPERTS_FIELD_EXPERTISE: "Plant",
                 },
                 {
-                    validation.EXPERTS_INAT_ID_FIELD: 1002,
-                    validation.EXPERTS_EXPERTISE_FIELD: "Plant",
+                    config.EXPERTS_FIELD_INAT_ID: 1002,
+                    config.EXPERTS_FIELD_EXPERTISE: "Plant",
                 },
             ]
         ).to_csv(experts_file, index=False)
 
         df = pipeline.update_experts(
             str(experts_file),
-            validation.EXPERTS_INAT_ID_FIELD,
-            validation.EXPERTS_EXPERTISE_FIELD,
+            config.EXPERTS_FIELD_INAT_ID,
+            config.EXPERTS_FIELD_EXPERTISE,
             db_manager
         )
 
@@ -926,21 +885,24 @@ class TestReview:
         pd.DataFrame(
             [
                 {
-                    validation.EXPERTS_INAT_ID_FIELD: 1001,
-                    validation.EXPERTS_EXPERTISE_FIELD: "Plant",
+                    config.EXPERTS_FIELD_INAT_ID: 1001,
+                    config.EXPERTS_FIELD_EXPERTISE: "Plant",
                 }
             ]
         ).to_csv(experts_file, index=False)
 
         cfg_review = config.ReviewConfig(
-            export_path=str(export_file),
-            experts_id_field=validation.EXPERTS_INAT_ID_FIELD,
-            experts_expertise_field=validation.EXPERTS_EXPERTISE_FIELD,
-            experts_file=str(experts_file),
-            export_format=pipeline.EXPORT_FORMAT_CSV
+            experts_id_field=config.EXPERTS_FIELD_INAT_ID,
+            experts_expertise_field=config.EXPERTS_FIELD_EXPERTISE,
         )
 
-        pipeline.run_review(cfg_review, db_manager)
+        pipeline.run_review(
+            str(experts_file),
+            export_format=pipeline.EXPORT_FORMAT_CSV,
+            export_path=str(export_file),
+            cfg_review=cfg_review,
+            db_manager=db_manager
+        )
 
         assert export_file.exists()
         export_df = pd.read_csv(export_file)
@@ -951,7 +913,9 @@ class TestReview:
         assert "annotations" in export_df.columns
 
 
-
+# ---------------------------------------------------------------------------
+# Full Pipeline
+# ---------------------------------------------------------------------------
 class TestFullPipeline:
     @staticmethod
     def _write_tracking_csv(path: Path):
@@ -961,33 +925,33 @@ class TestFullPipeline:
                     "est_id": 101, "egt_id": 5001, "sci_name": "Carex stipata",
                     "global_sci_name": "Carex stipata", "classification_level": "Species",
                     "parent_egt_id": None, "parent_sci_name": None, "element_type": "Plant",
-                    "scomname": "owlfruit sedge", "family": "Cyperaceae", "genus_egt_id": 201,
-                    "genus": "Carex", "author": "Muhlenberg ex Willdenow", "egt_uid": "EGT-001",
-                    "s_rank": "S5", "eo_track_status_desc": "Tracked",
+                    "common_name": "owlfruit sedge", "family": "Cyperaceae", "genus_egt_id": 201,
+                    "genus_sci_name": "Carex", "author": "Muhlenberg ex Willdenow", "egt_uid": "EGT-001",
+                    "srank": "S5", "track_status": "Tracked",
                     "explorer": "https://example.org/explorer/carex-stipata",
-                    "elcode_bcd": "ABNAB", "name_category_desc": "Vascular plant",
+                    "elcode": "ABNAB", "name_category_desc": "Vascular plant",
                     "growth_habit": "Sedge", "duration": "Perennial",
                 },
                 {
                     "est_id": 102, "egt_id": 5002, "sci_name": "Aster amellus",
                     "global_sci_name": "Aster amellus", "classification_level": "Species",
                     "parent_egt_id": None, "parent_sci_name": None, "element_type": "Plant",
-                    "scomname": "European starwort", "family": "Asteraceae", "genus_egt_id": 202,
-                    "genus": "Aster", "author": "L.", "egt_uid": "EGT-002",
-                    "s_rank": "S4", "eo_track_status_desc": "Tracked",
+                    "common_name": "European starwort", "family": "Asteraceae", "genus_egt_id": 202,
+                    "genus_sci_name": "Aster", "author": "L.", "egt_uid": "EGT-002",
+                    "srank": "S4", "track_status": "Tracked",
                     "explorer": "https://example.org/explorer/aster-amellus",
-                    "elcode_bcd": "ABNAB", "name_category_desc": "Vascular plant",
+                    "elcode": "ABNAB", "name_category_desc": "Vascular plant",
                     "growth_habit": "Forb", "duration": "Perennial",
                 },
                 {
                     "est_id": 103, "egt_id": 5003, "sci_name": "Nuphar advena",
                     "global_sci_name": "Nuphar advena", "classification_level": "Species",
                     "parent_egt_id": None, "parent_sci_name": None, "element_type": "Plant",
-                    "scomname": "spadderdock", "family": "Nymphaeaceae", "genus_egt_id": 203,
-                    "genus": "Nuphar", "author": "Aiton", "egt_uid": "EGT-003",
-                    "s_rank": "S5", "eo_track_status_desc": "Tracked",
+                    "common_name": "spadderdock", "family": "Nymphaeaceae", "genus_egt_id": 203,
+                    "genus_sci_name": "Nuphar", "author": "Aiton", "egt_uid": "EGT-003",
+                    "srank": "S5", "track_status": "Tracked",
                     "explorer": "https://example.org/explorer/nuphar-advena",
-                    "elcode_bcd": "ABNAB", "name_category_desc": "Vascular plant",
+                    "elcode": "ABNAB", "name_category_desc": "Vascular plant",
                     "growth_habit": "Aquatic", "duration": "Perennial",
                 },
             ]
@@ -1006,6 +970,8 @@ class TestFullPipeline:
         auth = MagicMock()
 
         # 1) build taxon mapping
+        cfg_taxa = config.TaxaConfig(rebuild=True)
+        
         tracking = tmp_path / "tracking.csv"
         overrides = tmp_path / "overrides.csv"
 
@@ -1013,7 +979,7 @@ class TestFullPipeline:
         self._write_overrides_csv(overrides)
 
         with patch.object(pipeline.taxa, "TaxonMappingBuilder", FakeTaxonMappingBuilder):
-            pipeline.build_taxon_mapping(str(tracking), str(overrides), db_manager, auth)
+            pipeline.build_taxon_mapping(str(tracking), str(overrides), cfg_taxa, db_manager, auth)
 
         # 2) download observations - est_id 101/102 resolve via override (12345/67890),
         # 103 via FakeTaxonMappingBuilder's "Nuphar advena" entry (99999)
@@ -1041,32 +1007,27 @@ class TestFullPipeline:
         with patch("inatdatapipeline.pipeline.helpers.fetch_project_members", return_value=[1]):
             pipeline.update_project_members(247148, db_manager, auth)
 
-        ann_opts = annotations.AnnotationOptions(
-            categories=[{"annotation_id": 1, "label": "Life Stage"}],
-            values=[{"value_id": 1, "annotation_id": 1, "label": "Adult"}],
-        )
+        categories = [{"annotation_id": 1, "label": "Life Stage"}]
+        values = [{"value_id": 1, "annotation_id": 1, "label": "Adult"}]
 
-        with patch("inatdatapipeline.pipeline.annotations.fetch_annotations", return_value=ann_opts):
+        with patch("inatdatapipeline.pipeline.helpers.fetch_annotations", return_value=(categories, values)):
             pipeline.update_annotations(db_manager, auth)
 
         experts_file = tmp_path / "experts.csv"
         pd.DataFrame(
             [{
-                validation.EXPERTS_INAT_ID_FIELD: 1001,
-                validation.EXPERTS_EXPERTISE_FIELD: "Plant"
+                config.EXPERTS_FIELD_INAT_ID: 1001,
+                config.EXPERTS_FIELD_EXPERTISE: "Plant"
             }]
         ).to_csv(experts_file, index=False)
 
         export_csv = tmp_path / "reviewed.csv"
         cfg_review = config.ReviewConfig(
-            experts_file=str(experts_file),
-            experts_id_field=validation.EXPERTS_INAT_ID_FIELD,
-            experts_expertise_field=validation.EXPERTS_EXPERTISE_FIELD,
-            export_path=str(export_csv),
-            export_format="CSV File",
+            experts_id_field=config.EXPERTS_FIELD_INAT_ID,
+            experts_expertise_field=config.EXPERTS_FIELD_EXPERTISE,
         )
 
-        pipeline.run_review(cfg_review, db_manager)
+        pipeline.run_review(str(experts_file), "CSV File", str(export_csv), cfg_review, db_manager)
 
         assert export_csv.exists()
         assert export_csv.stat().st_size > 0

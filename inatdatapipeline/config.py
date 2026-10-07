@@ -20,6 +20,15 @@ from pydantic import (
     ValidationError,
 )
 
+# Overrides default fields
+OVERRIDES_FIELD_EST_ID = "est_id"
+OVERRIDES_FIELD_INAT_NAME = "inat_name"
+OVERRIDES_FIELD_TAXON_ID = "taxon_id"
+
+# Experts list default fields
+EXPERTS_FIELD_INAT_ID = "iNaturalist_id"
+EXPERTS_FIELD_EXPERTISE = "Expertise LU"
+
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
@@ -132,42 +141,16 @@ class ObservationsConfig(BaseModel):
 
 class TaxaConfig(BaseModel):
     """Model for taxon mapping command configurations"""
-    tracking_list       : RequiredExistingCSV
-    name_overrides_file : RequiredExistingCSV
+    rebuild                 : bool
+    override_est_id_field   : str = OVERRIDES_FIELD_EST_ID
+    override_inat_name_field: str = OVERRIDES_FIELD_INAT_NAME
+    override_taxon_id_field : str = OVERRIDES_FIELD_TAXON_ID
+
 
 class ReviewConfig(BaseModel):
     """Model for review command configurations"""
-    experts_file            : RequiredExistingCSV
-    experts_id_field        : str
-    experts_expertise_field : str
-    export_format           : str
-    export_path             : str
-
-
-T = TypeVar('T', bound=BaseModel)
-
-def validate_config(
-        obj: dict,
-        section_name: str = None,
-        model_cls: Type[T] = None
-) -> Tuple[CoreConfig, Optional[T]]:
-    """
-    Validate a config section.
-    Arguments:
-        obj:
-            Dictionary containing the config objects (click context object)
-        section_name:
-            The name of the config section to load.
-        model_cls:
-            The pydantic config model to use to validate the config section.
-    Returns:
-        A validated model of the specified type.
-    """
-
-    if not section_name or not model_cls:
-        raise ValueError("Missing section name or config model type!")
-
-    section_data = obj.get(section_name, {})
-    result = model_cls(**section_data)
-
-    return result
+    # experts_file            : RequiredExistingCSV
+    experts_id_field        : str = EXPERTS_FIELD_INAT_ID
+    experts_expertise_field : str = EXPERTS_FIELD_EXPERTISE
+    # export_format           : str
+    # export_path             : str

@@ -30,6 +30,8 @@ print(sys.path)
 import inatdatapipeline
 from inatdatapipeline import (
     pipeline,
+    schemas,
+    config
 )
 from inatdatapipeline.client import (
     authentication,
@@ -37,10 +39,6 @@ from inatdatapipeline.client import (
     taxa,
     review,
     helpers
-)
-from inatdatapipeline.schemas import (
-    config, 
-    validation
 )
 from inatdatapipeline.database import (
     db,
@@ -54,7 +52,7 @@ importlib.reload(db)
 importlib.reload(gdb_export)
 importlib.reload(pipeline)
 importlib.reload(config)
-importlib.reload(validation)
+importlib.reload(schemas)
 importlib.reload(taxa)
 importlib.reload(review)
 importlib.reload(helpers)
@@ -64,7 +62,7 @@ import inatdatapipeline
 ##### Global variables #####
 user_agent = "iNat_ORBIC_DataPipeline/1.0"
 # .sql file with database schema
-sql_file_path = top_level_dir.joinpath("inatdatapipeline", "schema.sql")
+sql_file_path = top_level_dir.joinpath("inatdatapipeline", "database", "schema.sql")
 log_file = "pipeline.log"
 log_file_path = top_level_dir.joinpath("logs", log_file)
 
@@ -267,7 +265,45 @@ class TaxonMapping(Tool):
         )
         name_overrides.filter.list = ["csv"]
 
-        return params + [tracking_list, name_overrides]
+        override_est_id_field = arcpy.Parameter(
+            displayName="Overrides EST ID field",
+            name="overrides_est_id_field",
+            datatype="Field",
+            parameterType="Required",
+            direction="Input"
+        )
+        override_est_id_field.parameterDependencies = [name_overrides.name]
+        override_est_id_field.value = "est_id"
+
+        override_inat_name_field = arcpy.Parameter(
+            displayName="Overrides iNaturalist name field",
+            name="override_inat_name_field",
+            datatype="Field",
+            parameterType="Required",
+            direction="Input" 
+        )
+        override_inat_name_field.parameterDependencies = [name_overrides.name]
+        override_inat_name_field.value = "inat_name"
+
+        override_taxon_id_field = arcpy.Parameter(
+            displayName="Overrides taxon ID field",
+            name="override_taxon_id_field",
+            datatype="Field",
+            parameterType="Required",
+            direction="Input"
+        )
+        override_taxon_id_field.parameterDependencies = [name_overrides.name]
+        override_taxon_id_field.value = "taxon_id"
+
+        new_fields = [
+            tracking_list,
+            name_overrides,
+            override_est_id_field,
+            override_inat_name_field,
+            override_taxon_id_field
+        ]
+
+        return params + new_fields
 
     def execute(self, parameters, messages):
         """Tool source code"""
@@ -279,10 +315,18 @@ class TaxonMapping(Tool):
         tracking_csv = parameters[2].valueAsText
         overrides_csv = parameters[3].valueAsText
 
+        cfg_taxa = config.TaxaConfig(
+            rebuild=False,
+            override_est_id_field=parameters[4].valueAsText,
+            override_inat_name_field=parameters[5].valueAsText,
+            override_taxon_id_field=parameters[6].valueAsText
+        )
+
         try:
             pipeline.build_taxon_mapping(
                 tracking_csv,
                 overrides_csv,
+                cfg_taxa,
                 self.db_manager,
                 self.auth
             )
@@ -524,18 +568,18 @@ class RunReview(Tool):
         else:
             export_path = parameters[9].valueAsText
 
+        experts_file = parameters[4].valueAsText
+        export_format = parameters[7].valueAsText
+
         cfg_rev = config.ReviewConfig(
-            experts_file=parameters[4].valueAsText,
             experts_id_field=parameters[5].valueAsText,
             experts_expertise_field=parameters[6].valueAsText,
-            export_format=parameters[7].valueAsText,
-            export_path=export_path
         )
         
         try:
             if update_from_inat:
                 pipeline.update_project_members(project_id, self.db_manager, self.auth)
                 pipeline.update_annotations(self.db_manager, self.auth)
-            pipeline.run_review(cfg_rev, self.db_manager)
+            pipeline.run_review(experts_file, export_format, export_path, cfg_rev, self.db_manager)
         except ValueError as ex:
             _exit_failure(ex)

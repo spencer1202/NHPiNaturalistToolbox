@@ -2,14 +2,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 import logging
 import pandas as pd
+from pathlib import Path
 
 from inatdatapipeline.client import (
-    observations,
-    annotations
+    observations
 )
-from inatdatapipeline.client.observations import ObservationResults
-from inatdatapipeline.schemas import config
-from inatdatapipeline.schemas.validation import (
+from inatdatapipeline.client.observations import ObservationResultsClean
+from inatdatapipeline import config
+from inatdatapipeline.schemas import (
     ObservationSchema,
     IdentificationsSchema,
     ExpertsSchema
@@ -18,7 +18,7 @@ from inatdatapipeline.database.db import DBManager
 from inatdatapipeline.client.authentication import INaturalistAuth
 from inatdatapipeline.client import review
 
-data_file = "tests/data.pkl"
+SCHEMA_SQL = Path(__file__).resolve().parents[1] / "inatdatapipeline" / "database" / "schema.sql"
 
 # ---------------------------------------------------------------------------
 # Class object fixtures
@@ -28,6 +28,17 @@ def auth():
     mock = MagicMock()
     mock.get_auth_headers.return_value = {"Authorization": "Bearer test_token"}
     return mock
+
+@pytest.fixture
+def db_manager(tmp_path):
+    db_path = tmp_path / "taxa_integration.gpkg"
+    manager = DBManager(str(db_path))
+    manager.connect()
+    manager.setup_db(str(SCHEMA_SQL))
+    yield manager
+    if manager._conn is not None:
+        manager._conn.close()
+
 # ---------------------------------------------------------------------------
 
 
@@ -60,7 +71,22 @@ def experts_raw():
 
 @pytest.fixture
 def experts_clean(experts_raw):
-    return ExpertsSchema.from_raw(experts_raw)
+    return ExpertsSchema.from_raw(experts_raw, config.EXPERTS_FIELD_INAT_ID, config.EXPERTS_FIELD_EXPERTISE)
+
+@pytest.fixture
+def annotation_results():
+    return (
+        [
+            {"annotation_id": 1, "label": "Life Stage"},
+            {"annotation_id": 2, "label": "Plant Phenology"},
+        ],
+        [
+            {"value_id": 1, "annotation_id": 1, "label": "Adult"},
+            {"value_id": 2, "annotation_id": 1, "label": "Juvenile"},
+            {"value_id": 3, "annotation_id": 2, "label": "Flowering"},
+            {"value_id": 4, "annotation_id": 2, "label": "Fruiting"},
+        ]
+    )
 
 @pytest.fixture
 def full_observation_from_sqlite_df():

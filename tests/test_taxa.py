@@ -3,10 +3,16 @@ import logging
 import pytest
 import warnings
 import pandas as pd
+import numpy as np
+from requests import HTTPError, Timeout
 
 from inatdatapipeline.client.taxa import (
     Taxon,
     TaxonMappingBuilder
+)
+from inatdatapipeline import config
+from inatdatapipeline.schemas import (
+    TrackingListSchema
 )
 
 # Set up logging
@@ -68,6 +74,10 @@ def overrides_df():
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def get_cfg(rebuild: bool = False):
+    return config.TaxaConfig(rebuild=rebuild)
+
+
 def make_api_response(results: list) -> MagicMock:
     mock_response = MagicMock()
     mock_response.raise_for_status.return_value = None
@@ -117,43 +127,45 @@ class TestTaxon:
 # ---------------------------------------------------------------------------
 # preprocess_name
 # ---------------------------------------------------------------------------
+# TODO preprocessing functions now live in schemas.py. Move tests to new module test_schemas
 class TestPreprocessName:
+
     def test_removes_var(self):
-        assert TaxonMappingBuilder._preprocess_name("Plagiochila semidecurrens var. semidecurrens") == "Plagiochila semidecurrens semidecurrens"
+        assert TrackingListSchema._preprocess_name("Plagiochila semidecurrens var. semidecurrens") == "Plagiochila semidecurrens semidecurrens"
     
     def test_removes_ssp(self):
-        assert TaxonMappingBuilder._preprocess_name("Sidalcea malviflora ssp. patula") == "Sidalcea malviflora patula"
+        assert TrackingListSchema._preprocess_name("Sidalcea malviflora ssp. patula") == "Sidalcea malviflora patula"
     
     def test_removes_pop(self):
-        assert TaxonMappingBuilder._preprocess_name("Salvelinus confluentus pop. 25") == "Salvelinus confluentus 25"
+        assert TrackingListSchema._preprocess_name("Salvelinus confluentus pop. 25") == "Salvelinus confluentus 25"
     
     def test_removes_sp(self):
-         assert TaxonMappingBuilder._preprocess_name("Salix sp. 12") == "Salix 12"
+         assert TrackingListSchema._preprocess_name("Salix sp. 12") == "Salix 12"
         
     def test_plain_binomial_unchanged(self):
-        assert TaxonMappingBuilder._preprocess_name("Sardinops sagax") == "Sardinops sagax"
+        assert TrackingListSchema._preprocess_name("Sardinops sagax") == "Sardinops sagax"
 
     def test_none_returns_none(self):
-        assert TaxonMappingBuilder._preprocess_name(None) is None
+        assert TrackingListSchema._preprocess_name(None) is None
 
     def test_nan_returns_none(self):
-        assert TaxonMappingBuilder._preprocess_name(float("nan")) is None
+        assert TrackingListSchema._preprocess_name(float("nan")) is None
     
     def test_empty_string_returns_none(self):
-        assert TaxonMappingBuilder._preprocess_name("") is None
+        assert TrackingListSchema._preprocess_name("") is None
     
     def test_cleans_double_spaces(self):
-        result = TaxonMappingBuilder._preprocess_name("Aster  alpinus")
+        result = TrackingListSchema._preprocess_name("Aster  alpinus")
         assert "  " not in result
 
     def test_single_word_name_passes_through_unchanged(self):
         """A bare genus-only name has no var./ssp./pop. suffix to strip, so it should
         pass through unchanged rather than returning None."""
-        assert TaxonMappingBuilder._preprocess_name("Bacteria") == "Bacteria"
+        assert TrackingListSchema._preprocess_name("Bacteria") == "Bacteria"
 
     def test_single_word_name_logs_warning(self, caplog):
         with caplog.at_level(logging.WARNING, logger="pipeline"):
-            TaxonMappingBuilder._preprocess_name("Bacteria")
+            TrackingListSchema._preprocess_name("Bacteria")
         assert "Bacteria" in caplog.text
     
 
@@ -163,23 +175,23 @@ class TestPreprocessName:
 class TestGetUndescribedNames:
     def test_marks_described_taxa_as_described(self):
         names = pd.Series(["Carex stipata", "Aster alpinus"])
-        result = TaxonMappingBuilder._get_undescribed_names(names)
+        result = TrackingListSchema._get_undescribed_names(names)
         assert ~result.any()
 
     def test_marks_undescribed_taxa(self):
         names = pd.Series(["Salix 12", "Carex stipata"])
-        result = TaxonMappingBuilder._get_undescribed_names(names)
+        result = TrackingListSchema._get_undescribed_names(names)
         assert result.loc[0]
         assert not result.loc[1]
     
     def test_extracts_generic_name(self):
         names = pd.Series(["Salix 12"])
-        result = TaxonMappingBuilder._get_undescribed_names(names)
+        result = TrackingListSchema._get_undescribed_names(names)
         assert result.loc[0] == "Salix"
     
     def test_preserved_described_name(self):
         names = pd.Series(["Salix 12", "Carex stipata"])
-        result = TaxonMappingBuilder._get_undescribed_names(names)
+        result = TrackingListSchema._get_undescribed_names(names)
         assert result.loc[1] == ""
 
     def test_single_word_name_marked_undescribed(self):
@@ -188,7 +200,7 @@ class TestGetUndescribedNames:
         species and should be treated as undescribed, with the generic name equal to itself.
         """
         names = pd.Series(["Bacteria", "Carex stipata"])
-        result = TaxonMappingBuilder._get_undescribed_names(names)
+        result = TrackingListSchema._get_undescribed_names(names)
         assert result.loc[0] == "Bacteria"
         assert result.loc[1] == ""
 
@@ -196,7 +208,7 @@ class TestGetUndescribedNames:
         names = pd.Series(["Carex stipata", "Aster alpinus"])
         with warnings.catch_warnings():
             warnings.simplefilter("error", FutureWarning)
-            TaxonMappingBuilder._get_undescribed_names(names) # should not raise
+            TrackingListSchema._get_undescribed_names(names) # should not raise
 
 
 # ---------------------------------------------------------------------------
@@ -206,19 +218,19 @@ class TestFillParent:
     def test_fills_missing_parent_from_egt_id_and_global_name(self, tracking_df):
         """est_id 4 (Subspecies) has no parent info in the raw tracking data, so it
         should be filled from its own egt_id/global_sci_name."""
-        parent_egt_id, parent_sci_name = TaxonMappingBuilder._fill_parent(tracking_df)
+        df = TrackingListSchema._fill_parent(tracking_df)
 
         row4 = tracking_df.index[tracking_df["est_id"] == 4][0]
-        assert parent_egt_id.loc[row4] == 14
-        assert parent_sci_name.loc[row4] == "Festuca rubra"
+        assert df.loc[row4, "parent_egt_id"] == 14
+        assert df.loc[row4, "parent_sci_name"] == "Festuca rubra"
 
     def test_preserves_existing_parent_values(self, tracking_df):
         """est_id 1 (Variety) already has parent info set and shouldn't be overwritten."""
-        parent_egt_id, parent_sci_name = TaxonMappingBuilder._fill_parent(tracking_df)
+        df = TrackingListSchema._fill_parent(tracking_df)
 
         row1 = tracking_df.index[tracking_df["est_id"] == 1][0]
-        assert parent_egt_id.loc[row1] == 101
-        assert parent_sci_name.loc[row1] == "Aster alpinus"
+        assert df.loc[row1, "parent_egt_id"] == 101
+        assert df.loc[row1, "parent_sci_name"] == "Aster alpinus"
 
 
 # ---------------------------------------------------------------------------
@@ -226,30 +238,30 @@ class TestFillParent:
 # ---------------------------------------------------------------------------
 class TestPreprocess:
     def test_applies_overrides(self, tracking_df, overrides_df):
-        result = TaxonMappingBuilder.preprocess_tracking_df(tracking_df, overrides_df)
+        result = TrackingListSchema.run_all_preprocessing(tracking_df, overrides_df)
         assert result.loc[result["est_id"] == 1, "override_name"].iloc[0] == "Aster alpinus"
         assert result.loc[result["est_id"] == 1, "sci_name"].iloc[0] == "Aster alpinus var. vierhapperi"
         assert result.loc[result["est_id"] == 1, "sci_name_clean"].iloc[0] == "Aster alpinus vierhapperi"
         
     def test_non_overriden_names_preprocessed(self, tracking_df, overrides_df):
-        result = TaxonMappingBuilder.preprocess_tracking_df(tracking_df, overrides_df)
+        result = TrackingListSchema.run_all_preprocessing(tracking_df, overrides_df)
         assert result.loc[result["est_id"] == 4, "override_name"].iloc[0] is None
         assert result.loc[result["est_id"] == 4, "sci_name"].iloc[0] == "Festuca rubra ssp. secunda"
         assert result.loc[result["est_id"] == 4, "sci_name_clean"].iloc[0] == "Festuca rubra secunda"
 
     def test_parent_filled_with_global_name(self, tracking_df, overrides_df):
-        result = TaxonMappingBuilder.preprocess_tracking_df(tracking_df, overrides_df)
+        result = TrackingListSchema.run_all_preprocessing(tracking_df, overrides_df)
         assert result.loc[result["est_id"] == 4, "override_name"].iloc[0] is None
         assert result.loc[result["est_id"] == 4, "sci_name_clean"].iloc[0] == "Festuca rubra secunda"
         assert result.loc[result["est_id"] == 4, "parent_sci_name"].iloc[0] == "Festuca rubra"
         assert result.loc[result["est_id"] == 4, "parent_egt_id"].iloc[0] == 14
 
     def test_undescribed_taxa_marked(self, tracking_df, overrides_df):
-        result = TaxonMappingBuilder.preprocess_tracking_df(tracking_df, overrides_df)
+        result = TrackingListSchema.run_all_preprocessing(tracking_df, overrides_df)
         assert not result.loc[result["est_id"] == 3, "is_described"].iloc[0]
 
     def test_described_taxa_marked(self, tracking_df, overrides_df):
-        result = TaxonMappingBuilder.preprocess_tracking_df(tracking_df, overrides_df)
+        result = TrackingListSchema.run_all_preprocessing(tracking_df, overrides_df)
         assert result.loc[result["est_id"] == 2, "is_described"].iloc[0]
 
     def test_override_not_matching_any_tracking_row_ignored(self, tracking_df, overrides_df):
@@ -261,7 +273,7 @@ class TestPreprocess:
         df["est_id"] = [999]
         df["inat_name"] = ["Should Not Apply"]
 
-        result = TaxonMappingBuilder.preprocess_tracking_df(tracking_df, df)
+        result = TrackingListSchema.run_all_preprocessing(tracking_df, df)
 
         assert result.loc[result["est_id"] == 1, "sci_name_clean"].iloc[0] == "Aster alpinus vierhapperi"
         assert "Should Not Apply" not in result["override_name"].values
@@ -376,7 +388,7 @@ class TestSelectMatchingName:
 # ---------------------------------------------------------------------------
 class TestMakeTaxonRequest:
     def test_sends_q_param_when_no_override(self, auth):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         api_results = [{"id": 123, "name": "Carex stipata", "matched_term": "Carex stipata"}]
         with patch("inatdatapipeline.client.taxa.requests.get") as mock_get:
             mock_get.return_value = make_api_response(api_results)
@@ -389,7 +401,7 @@ class TestMakeTaxonRequest:
         assert "taxon_id" not in params
 
     def test_sends_taxon_id_param_for_override(self, auth):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         api_results = [{"id": 123, "name": "Carex stipata", "matched_term": "Carex stipata"}]
         with patch("inatdatapipeline.client.taxa.requests.get") as mock_get:
             mock_get.return_value = make_api_response(api_results)
@@ -402,7 +414,7 @@ class TestMakeTaxonRequest:
         assert "q" not in params
 
     def test_includes_rank_filter_for_classification_level(self, auth):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         api_results = [{"id": 123, "name": "Carex stipata", "matched_term": "Carex stipata"}]
         with patch("inatdatapipeline.client.taxa.requests.get") as mock_get:
             mock_get.return_value = make_api_response(api_results)
@@ -414,7 +426,7 @@ class TestMakeTaxonRequest:
         assert params["rank"] == "species"
 
     def test_omits_rank_filter_when_no_classification_level(self, auth):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         api_results = [{"id": 123, "name": "Carex stipata", "matched_term": "Carex stipata"}]
         with patch("inatdatapipeline.client.taxa.requests.get") as mock_get:
             mock_get.return_value = make_api_response(api_results)
@@ -426,7 +438,7 @@ class TestMakeTaxonRequest:
         assert "rank" not in params
 
     def test_increments_request_count(self, auth):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         api_results = [{"id": 123, "name": "Carex stipata", "matched_term": "Carex stipata"}]
         with patch("inatdatapipeline.client.taxa.requests.get") as mock_get:
             mock_get.return_value = make_api_response(api_results)
@@ -437,7 +449,7 @@ class TestMakeTaxonRequest:
         assert builder.request_count == 2
 
     def test_returns_results_list(self, auth):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         api_results = [{"id": 123, "name": "Carex stipata", "matched_term": "Carex stipata"}]
         with patch("inatdatapipeline.client.taxa.requests.get") as mock_get:
             mock_get.return_value = make_api_response(api_results)
@@ -447,7 +459,7 @@ class TestMakeTaxonRequest:
         assert result == api_results
 
     def test_sleeps_once_per_request(self, auth):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         api_results = [{"id": 123, "name": "Carex stipata", "matched_term": "Carex stipata"}]
         with patch("inatdatapipeline.client.taxa.requests.get") as mock_get:
             mock_get.return_value = make_api_response(api_results)
@@ -458,7 +470,7 @@ class TestMakeTaxonRequest:
 
     def test_warns_when_auth_headers_missing(self, auth, caplog):
         auth.get_auth_headers.return_value = None
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         api_results = [{"id": 123, "name": "Carex stipata", "matched_term": "Carex stipata"}]
         with caplog.at_level(logging.WARNING, logger="pipeline"):
             with patch("inatdatapipeline.client.taxa.requests.get") as mock_get:
@@ -469,10 +481,9 @@ class TestMakeTaxonRequest:
         assert "Could not retrieve iNaturalist authentication." in caplog.text
 
     def test_http_error_increments_error_count_and_returns_none(self, auth):
-        import requests as req
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         mock_response = MagicMock()
-        mock_response.raise_for_status.side_effect = req.HTTPError("500 error")
+        mock_response.raise_for_status.side_effect = HTTPError("500 error")
         with patch("inatdatapipeline.client.taxa.requests.get") as mock_get:
             mock_get.return_value = mock_response
             with patch("inatdatapipeline.client.taxa.time.sleep"):
@@ -485,7 +496,7 @@ class TestMakeTaxonRequest:
         """Connection-level failures (not just bad HTTP status) should also be caught and
         count toward the error threshold."""
         import requests as req
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         with patch("inatdatapipeline.client.taxa.requests.get") as mock_get:
             mock_get.side_effect = req.ConnectionError("network down")
             with patch("inatdatapipeline.client.taxa.time.sleep"):
@@ -495,10 +506,9 @@ class TestMakeTaxonRequest:
         assert builder.error_count == 1
 
     def test_timeout_is_caught_and_counted(self, auth):
-        import requests as req
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         with patch("inatdatapipeline.client.taxa.requests.get") as mock_get:
-            mock_get.side_effect = req.Timeout("timed out")
+            mock_get.side_effect = Timeout("timed out")
             with patch("inatdatapipeline.client.taxa.time.sleep"):
                 result = builder._make_taxon_request("Carex stipata")
 
@@ -508,10 +518,9 @@ class TestMakeTaxonRequest:
     def test_error_never_reads_response_body(self, auth):
         """A tolerated error should return None immediately, without attempting to parse a
         body from the failed response."""
-        import requests as req
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         mock_response = MagicMock()
-        mock_response.raise_for_status.side_effect = req.HTTPError("500 error")
+        mock_response.raise_for_status.side_effect = HTTPError("500 error")
         mock_response.json.side_effect = AssertionError("json() should not be called on a failed response")
         with patch("inatdatapipeline.client.taxa.requests.get") as mock_get:
             mock_get.return_value = mock_response
@@ -522,10 +531,9 @@ class TestMakeTaxonRequest:
         mock_response.json.assert_not_called()
 
     def test_sleeps_on_error_path(self, auth):
-        import requests as req
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         mock_response = MagicMock()
-        mock_response.raise_for_status.side_effect = req.HTTPError("500 error")
+        mock_response.raise_for_status.side_effect = HTTPError("500 error")
         with patch("inatdatapipeline.client.taxa.requests.get") as mock_get:
             mock_get.return_value = mock_response
             with patch("inatdatapipeline.client.taxa.time.sleep") as mock_sleep:
@@ -534,10 +542,9 @@ class TestMakeTaxonRequest:
         mock_sleep.assert_called_once_with(1)
 
     def test_error_count_accumulates_across_calls(self, auth):
-        import requests as req
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         mock_response = MagicMock()
-        mock_response.raise_for_status.side_effect = req.HTTPError("500 error")
+        mock_response.raise_for_status.side_effect = HTTPError("500 error")
         with patch("inatdatapipeline.client.taxa.requests.get") as mock_get:
             mock_get.return_value = mock_response
             with patch("inatdatapipeline.client.taxa.time.sleep"):
@@ -548,10 +555,9 @@ class TestMakeTaxonRequest:
         assert builder.error_count == 3
 
     def test_raises_after_five_errors(self, auth):
-        import requests as req
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         mock_response = MagicMock()
-        mock_response.raise_for_status.side_effect = req.HTTPError("500 error")
+        mock_response.raise_for_status.side_effect = HTTPError("500 error")
         with patch("inatdatapipeline.client.taxa.requests.get") as mock_get:
             mock_get.return_value = mock_response
             with patch("inatdatapipeline.client.taxa.time.sleep"):
@@ -564,7 +570,7 @@ class TestMakeTaxonRequest:
         assert builder.error_count == 5
 
     def test_error_count_starts_at_zero(self, auth):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         assert builder.error_count == 0
 
 # ---------------------------------------------------------------------------
@@ -572,14 +578,14 @@ class TestMakeTaxonRequest:
 # ---------------------------------------------------------------------------
 class TestSearchAllRanks:
     def test_described_taxon_searches_normal(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         record = preprocessed_df.loc[preprocessed_df["est_id"] == 2].iloc[0].to_dict()  # Carex stipata
         with patch.object(builder, "_search_all_ranks_r") as mock_r:
             builder._search_all_ranks(record, set())
         mock_r.assert_called_once_with(record, set(), "normal")
 
     def test_undescribed_subrank_searches_parent(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         record = preprocessed_df.loc[preprocessed_df["est_id"] == 4].iloc[0].to_dict()  # Subspecies
         record["is_described"] = False
         with patch.object(builder, "_search_all_ranks_r") as mock_r:
@@ -587,7 +593,7 @@ class TestSearchAllRanks:
         mock_r.assert_called_once_with(record, set(), "parent")
 
     def test_undescribed_species_searches_genus(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         record = preprocessed_df.loc[preprocessed_df["est_id"] == 3].iloc[0].to_dict()  # Salix, Species, undescribed
         with patch.object(builder, "_search_all_ranks_r") as mock_r:
             builder._search_all_ranks(record, set())
@@ -599,12 +605,12 @@ class TestSearchAllRanks:
 # ---------------------------------------------------------------------------
 class TestSearchAllRanksRecursive:
     def test_invalid_search_type_raises(self, auth):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         with pytest.raises(ValueError, match="Invalid search type"):
             builder._search_all_ranks_r({}, set(), "bogus")
 
     def test_already_searched_name_skipped(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         record = preprocessed_df.loc[preprocessed_df["est_id"] == 2].iloc[0].to_dict()
         searched_set = {"Carex stipata"}
         with patch.object(builder, "_make_taxon_request") as mock_request:
@@ -614,7 +620,7 @@ class TestSearchAllRanksRecursive:
         assert result is None
 
     def test_normal_search_adds_name_to_searched_set(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         record = preprocessed_df.loc[preprocessed_df["est_id"] == 2].iloc[0].to_dict()
         searched_set = set()
         with patch.object(builder, "_make_taxon_request", return_value=None):
@@ -623,7 +629,7 @@ class TestSearchAllRanksRecursive:
         assert "Carex stipata" in searched_set
 
     def test_normal_search_found_match_sets_est_id(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         record = preprocessed_df.loc[preprocessed_df["est_id"] == 2].iloc[0].to_dict()
         api_results = [{"name": "Carex stipata", "id": 555, "matched_term": "Carex stipata"}]
         with patch.object(builder, "_make_taxon_request", return_value=api_results):
@@ -634,7 +640,7 @@ class TestSearchAllRanksRecursive:
         assert result.est_id == 2
 
     def test_normal_search_falls_back_to_parent_then_genus(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         record = preprocessed_df.loc[preprocessed_df["est_id"] == 4].iloc[0].to_dict()  # has parent_egt_id
         with patch.object(builder, "_make_taxon_request", return_value=None) as mock_request:
             result = builder._search_all_ranks_r(record, set(), "normal")
@@ -644,7 +650,7 @@ class TestSearchAllRanksRecursive:
         assert result is None
 
     def test_normal_search_skips_parent_when_no_parent_egt_id(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         record = preprocessed_df.loc[preprocessed_df["est_id"] == 3].iloc[0].to_dict()  # no parent
         with patch.object(builder, "_make_taxon_request", return_value=None) as mock_request:
             result = builder._search_all_ranks_r(record, set(), "normal")
@@ -656,7 +662,7 @@ class TestSearchAllRanksRecursive:
         assert result is None
 
     def test_parent_search_falls_back_to_genus(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         record = preprocessed_df.loc[preprocessed_df["est_id"] == 4].iloc[0].to_dict()
         with patch.object(builder, "_make_taxon_request", return_value=None) as mock_request:
             result = builder._search_all_ranks_r(record, set(), "parent")
@@ -666,7 +672,7 @@ class TestSearchAllRanksRecursive:
         assert result is None
 
     def test_parent_search_found_match_sets_parent_egt_id(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         record = preprocessed_df.loc[preprocessed_df["est_id"] == 4].iloc[0].to_dict()
         api_results = [{"name": "Festuca rubra", "id": 777, "matched_term": "Festuca rubra"}]
         with patch.object(builder, "_make_taxon_request", return_value=api_results):
@@ -677,7 +683,7 @@ class TestSearchAllRanksRecursive:
         assert result.parent_egt_id == 14
 
     def test_parent_search_passes_subrank_name_to_select_matching_name(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         record = preprocessed_df.loc[preprocessed_df["est_id"] == 4].iloc[0].to_dict()
         api_results = [{"name": "Festuca rubra", "id": 777, "matched_term": "Festuca rubra"}]
         with patch.object(builder, "_make_taxon_request", return_value=api_results):
@@ -687,7 +693,7 @@ class TestSearchAllRanksRecursive:
         mock_select.assert_called_once_with("Festuca rubra", api_results, "Festuca rubra secunda")
 
     def test_genus_search_returns_none_when_no_match(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         record = preprocessed_df.loc[preprocessed_df["est_id"] == 3].iloc[0].to_dict()
         with patch.object(builder, "_make_taxon_request", return_value=None) as mock_request:
             result = builder._search_all_ranks_r(record, set(), "genus")
@@ -696,7 +702,7 @@ class TestSearchAllRanksRecursive:
         assert result is None
 
     def test_genus_search_found_match_sets_genus_egt_id(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         record = preprocessed_df.loc[preprocessed_df["est_id"] == 3].iloc[0].to_dict()
         api_results = [{"name": "Salix", "id": 888, "matched_term": "Salix"}]
         with patch.object(builder, "_make_taxon_request", return_value=api_results):
@@ -712,7 +718,7 @@ class TestSearchAllRanksRecursive:
 # ---------------------------------------------------------------------------
 class TestSearchOverride:
     def test_name_override_uses_select_matching_name(self, auth, overrides_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         override_row = overrides_df.iloc[0]
         api_results = [{"name": "Aster alpinus", "id": 42, "matched_term": "Aster alpinus"}]
         with patch.object(builder, "_make_taxon_request", return_value=api_results) as mock_request:
@@ -724,7 +730,7 @@ class TestSearchOverride:
         assert result.est_id == 1
 
     def test_id_override_uses_select_matching_id(self, auth, overrides_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         override_row = overrides_df.iloc[0]
         api_results = [{"name": "Aster alpinus", "id": 42, "matched_term": "Aster alpinus"}]
         with patch.object(builder, "_make_taxon_request", return_value=api_results) as mock_request:
@@ -735,7 +741,7 @@ class TestSearchOverride:
         assert result.est_id == 1
 
     def test_no_results_returns_none(self, auth, overrides_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         override_row = overrides_df.iloc[0]
         with patch.object(builder, "_make_taxon_request", return_value=None):
             result = builder._search_override(override_row["inat_name"], override_row["est_id"], None)
@@ -743,7 +749,7 @@ class TestSearchOverride:
         assert result is None
 
     def test_no_match_returns_none(self, auth, overrides_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         override_row = overrides_df.iloc[0]
         api_results = [{"name": "Unrelated Name", "id": 1, "matched_term": "Something Else"}]
         with patch.object(builder, "_make_taxon_request", return_value=api_results):
@@ -758,7 +764,7 @@ class TestSearchOverride:
 class TestCreateNewMappings:
     def test_generates_access_token_when_missing(self, auth, preprocessed_df):
         auth.get_access_token.return_value = None
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         df = preprocessed_df.loc[preprocessed_df["est_id"] == 2].copy()
         with patch.object(builder, "_search_all_ranks", return_value=None):
             builder.create_new_mappings(df, {})
@@ -767,7 +773,7 @@ class TestCreateNewMappings:
 
     def test_skips_generating_token_when_present(self, auth, preprocessed_df):
         auth.get_access_token.return_value = "existing-token"
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         df = preprocessed_df.loc[preprocessed_df["est_id"] == 2].copy()
         with patch.object(builder, "_search_all_ranks", return_value=None):
             builder.create_new_mappings(df, {})
@@ -775,7 +781,7 @@ class TestCreateNewMappings:
         auth.generate_access_token.assert_not_called()
 
     def test_uses_override_search_when_override_name_present(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         df = preprocessed_df.loc[preprocessed_df["est_id"] == 1].copy()
         df["override_name"] = ["Aster alpinus"]
         with patch.object(builder, "_search_override", return_value=None) as mock_override:
@@ -786,7 +792,7 @@ class TestCreateNewMappings:
         mock_ranks.assert_not_called()
 
     def test_uses_override_search_when_override_map_has_id(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         df = preprocessed_df.loc[preprocessed_df["est_id"] == 2].copy()
         override_map = {2: 999}
         with patch.object(builder, "_search_override", return_value=None) as mock_override:
@@ -797,7 +803,7 @@ class TestCreateNewMappings:
         mock_ranks.assert_not_called()
 
     def test_uses_rank_search_when_no_override(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         df = preprocessed_df.loc[preprocessed_df["est_id"] == 3].copy()
         with patch.object(builder, "_search_all_ranks", return_value=None) as mock_ranks:
             with patch.object(builder, "_search_override") as mock_override:
@@ -807,7 +813,7 @@ class TestCreateNewMappings:
         mock_override.assert_not_called()
 
     def test_matched_taxon_added_to_mappings(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         df = preprocessed_df.loc[preprocessed_df["est_id"] == 2].copy()
         found_taxon = Taxon(taxon_name="Carex stipata", taxon_id=42, est_id=2)
         with patch.object(builder, "_search_all_ranks", return_value=found_taxon):
@@ -818,7 +824,7 @@ class TestCreateNewMappings:
         assert result.iloc[0]["inat_name"] == "Carex stipata"
 
     def test_no_match_excluded_from_mappings(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         df = preprocessed_df.loc[preprocessed_df["est_id"] == 2].copy()
         with patch.object(builder, "_search_all_ranks", return_value=None):
             result = builder.create_new_mappings(df, {})
@@ -826,7 +832,7 @@ class TestCreateNewMappings:
         assert len(result) == 0
 
     def test_process_counters_updated(self, auth, preprocessed_df):
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         df = preprocessed_df.loc[preprocessed_df["est_id"].isin([1, 2])].copy()
         with patch.object(builder, "_search_all_ranks", return_value=None):
             builder.create_new_mappings(df, {})
@@ -837,7 +843,7 @@ class TestCreateNewMappings:
     def test_searched_set_shared_across_records(self, auth, preprocessed_df):
         """The same searched_set should be passed to every record's rank search, so
         repeated genus/species lookups across rows are deduplicated."""
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         df = preprocessed_df.loc[preprocessed_df["est_id"].isin([1, 2])].copy()
         seen_sets = []
 
@@ -853,7 +859,7 @@ class TestCreateNewMappings:
     def test_too_many_errors_propagates_out_of_create_new_mappings(self, auth, preprocessed_df):
         """Once _make_taxon_request's error threshold is hit, the ValueError should abort
         the whole run rather than being swallowed for just one taxon."""
-        builder = TaxonMappingBuilder(auth)
+        builder = TaxonMappingBuilder(get_cfg(), auth)
         df = preprocessed_df.loc[preprocessed_df["est_id"] == 2].copy()
 
         with patch.object(builder, "_search_all_ranks", side_effect=ValueError("Too many errors, aborting search")):
@@ -940,3 +946,42 @@ class TestGetToMatch:
             "genus_sci_name",
             "genus_egt_id",
         ]
+
+class TestBuild:
+    def test_build_skips_existing_mappings(self, tracking_df, overrides_df, auth):
+        old_mappings_df = pd.DataFrame({
+            "taxon_id": [10, 11],
+            "inat_name": ["A", "B"],
+            "est_id": [1, 2],
+            "parent_egt_id": [50, None],
+            "genus_egt_id": [None, None]
+        })
+
+        builder = TaxonMappingBuilder(get_cfg(), auth)
+        api_results = [
+            {"name": "Aster alpinus vierhapperi", "id": 666, "matched_term": "Aster alpinus vierhapperi"},
+            {"name": "Carex stipata", "id": 777, "matched_term": "Carex stipata"},
+            {"name": "Salix", "id": 888, "matched_term": "Salix"},
+            {"name": "Festuca rubra", "id": 999, "matched_term": "Festuca rubra"}
+        ]
+
+        with patch.object(builder, "_make_taxon_request", return_value=api_results):
+            results = builder.build(
+                tracking_df,
+                overrides_df,
+                old_mappings_df
+            )
+
+        est_ids = results["est_id"].replace({np.nan: None}).to_list()
+        genus_ids = results["genus_egt_id"].replace({np.nan: None}).to_list()
+        parent_ids = results["parent_egt_id"].replace({np.nan: None}).to_list()
+        taxon_ids = results["taxon_id"].replace({np.nan: None}).to_list()
+
+        assert 1 not in est_ids
+        assert 2 not in est_ids
+        assert 113 in genus_ids
+        assert 14 in parent_ids
+        assert 666 not in taxon_ids
+        assert 777 not in taxon_ids
+        assert 888 in taxon_ids
+        assert 999 in taxon_ids

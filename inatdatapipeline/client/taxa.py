@@ -13,10 +13,20 @@ from dataclasses import dataclass
 #### Third-party imports ####
 import requests
 import pandas as pd
+import pandera.pandas as pa
+from pandera.typing import DataFrame
 
 #### Local imports ####
 from inatdatapipeline.client.authentication import INaturalistAuth, TIMEOUT
-from inatdatapipeline.schemas.validation import TaxonMappingSchema
+from inatdatapipeline.client.helpers import report_schema_error
+from inatdatapipeline import config
+from inatdatapipeline import schemas
+from inatdatapipeline.schemas import (
+    TrackingListSchema,
+    TrackingRelSchema,
+    OverridesSchema,
+    MappingsSchema
+)
 
 # Set up logging
 logger = logging.getLogger('pipeline')
@@ -30,13 +40,12 @@ CLASS_LEVEL_MAP = {
     "Subspecies"    : "hybrid,subspecies,variety,form",
     "Genus"         : "genus"
 }
-BIOTICS_SUBRANKS = ["Population", "Variety", "Subspecies"]
 
 
 @dataclass
 class Taxon:
     """
-    An object representing an iNaturalist taxon and its mapping to a tracking list taxon.
+    An helper dataclass representing an iNaturalist taxon and its mapping to a tracking list taxon.
     """
     taxon_name      : str = None
     taxon_id        : int = None
@@ -58,21 +67,29 @@ class Taxon:
 # Taxon Mapping Builder
 # ---------------------------------------------------------------------------
 class TaxonMappingBuilder:
-    # TODO update docstring
     """
     This class is responsible for building a mapping between tracking list taxa and iNaturalist
-    taxa. It contains static methods for preprocessing the tracking list, isolating taxa that 
-    still need mappings, and building the mapping by requesting iNaturalist taxon names
-    and IDs from the iNaturalist Taxa API endpoint.
+    taxa.
     """
-    def __init__(self, auth: INaturalistAuth):
+    def __init__(self, cfg_taxa: config.TaxaConfig, auth: INaturalistAuth):
+        self.config: config.TaxaConfig = cfg_taxa
         self.auth: INaturalistAuth = auth
+
         self.request_count: int = 0
         self.process_count: int = 0
         self.process_total: int = 0
         self.error_count: int = 0
 
-    def _make_taxon_request(self, search_name: str, classification_level: str = None, override_id: int = None):
+        # Clean dataframes, populated after running
+        self.tracking_df: DataFrame[TrackingListSchema] = None
+        self.new_mappings_df: DataFrame[TrackingRelSchema] = None
+
+    def _make_taxon_request(
+            self,
+            search_name: str,
+            classification_level: str = None,
+            override_id: int = None
+    ):
         """
         Perform iNaturalist taxa API search for search_name. Ignores search_name in favor of override_id
         if one is provided.
@@ -106,7 +123,7 @@ class TaxonMappingBuilder:
             params["q"] = search_name
 
         try:
-            response = requests.get(URL, params, headers=headers)
+            response = requests.get(URL, params, headers=headers, timeout=TIMEOUT)
             self.request_count = self.request_count + 1
             response.raise_for_status()
         except requests.RequestException as ex:
@@ -147,15 +164,9 @@ class TaxonMappingBuilder:
                 )
             ):
                 taxon = result_name, result["id"]
-                
-            # if not alternative:
-                # alternative = result
 
         if taxon:
             return taxon
-        
-        # if alternative:
-            # return alternative["name"], alternative["id"]
 
         return None, None
 
@@ -201,7 +212,7 @@ class TaxonMappingBuilder:
         # Skip to next classification level for undescribed names
         logger.debug(" " * 14 + f"Skipping undescribed taxon: { record['sci_name_clean'] }")
         # Search for parent if this is a subrank, otherwise search for genus
-        if record["classification_level"] in BIOTICS_SUBRANKS:
+        if record["classification_level"] in schemas.BIOTICS_SUBRANKS:
             return self._search_all_ranks_r(record, searched_set, "parent")
         return self._search_all_ranks_r(record, searched_set, "genus")
 
@@ -270,7 +281,14 @@ class TaxonMappingBuilder:
 
 
     def _search_override(self, override_name: str, est_id: int, override_id: int) -> Taxon | None:
-        logger.info(" " * 14 + f"OVERRIDE: {override_name}{(' (%s)' % override_id) if override_id else ''}")
+        """
+        Searches for an override name or override ID, ignoring the override name if an override ID
+        is provided. Does not filter for classification level.
+        """
+        logger.info(
+            " " * 14 + f"OVERRIDE: {override_name}" 
+            + f"{(' (%s)' % override_id) if override_id else ''}"
+        )
         result = self._make_taxon_request(override_name, None, override_id)
         if result:
             if not override_id:
@@ -283,146 +301,13 @@ class TaxonMappingBuilder:
             return None
         
         return Taxon(match_name, match_id, est_id)
-    
-
-    @staticmethod
-    def _preprocess_name(name: str) -> str:
-        """
-        Preprocess taxon name for iNaturalist API query by converting trinomial format
-        
-        Converts names like "Aster alpinus var. vierhapperi" to "Aster alpinus vierhapperi"
-        which is the preferred format for iNaturalist queries.
-        
-        Args:
-            name: Scientific name to preprocess
-            
-        Returns:
-            Name with "var.", "pop.", and "ssp." removed for better iNaturalist matching
-        """
-        if not name or pd.isna(name):
-            return None
-
-        # Edge case: name is a single-word string, return name as is
-        is_single_word = re.fullmatch(r"^[A-Za-z\-]+", name.strip())
-        if is_single_word:
-            logger.warning("Encountered single-word taxon name '%s' - marking as undescribed.", name.strip())
-            return name.strip()
-
-        # Regular expression that extracts the genus name, species name, and subspecies name or
-        # subspecies/population number.
-        expr = r"^((?:[a-zA-Z\-]+[ \t]){1,2})(?:(?:var\.|pop\.|ssp\.|sp\.)\s)?(.+)?"
-        match = re.search(expr, name.strip())
-        if not match:       # some weird edge case
-            return None
-
-        processed_name = match.group(1) + match.group(2)
-
-        # Clean up any double spaces
-        while "  " in processed_name:
-            processed_name = processed_name.replace("  ", " ")
-
-        return processed_name.strip()
 
 
     @staticmethod
-    def _fill_parent(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
-        subrank_mask = df["classification_level"].isin(BIOTICS_SUBRANKS)
+    def build_override_id_map(
+        overrides_df: DataFrame[OverridesSchema]
+    ) -> dict[int, int]:
 
-        parent_egt_id = df["parent_egt_id"].copy()
-        parent_sci_name = df["parent_sci_name"].astype(object)
-
-        parent_egt_id.loc[subrank_mask] = parent_egt_id.loc[subrank_mask].fillna(df.loc[subrank_mask, "egt_id"])
-        parent_sci_name.loc[subrank_mask] = parent_sci_name.loc[subrank_mask].fillna(df.loc[subrank_mask, "global_sci_name"])
-
-        return parent_egt_id, parent_sci_name
-
-
-    @staticmethod
-    def _get_undescribed_names(names: pd.Series) -> pd.Series:
-        """
-        Extracts generic names for all undescribed taxa and returns them as a series.
-        Args:
-            names: Series of taxon names.
-
-        Returns:
-            A series that is populated by generic names for all undescribed taxa.
-
-        """
-        names = names.copy()
-
-        # Matches names with a number at the end, grabs all text before the number
-        expr = r"^((?:[A-Za-z\-]+[\t ])+)\d+$"
-        result = names.str.extract(expr, expand=False).str.strip()
-
-        # Second pass to check for single-word names
-        is_single_word = names.str.fullmatch(r"[A-Za-z\-]+").fillna(False)
-        result = result.fillna(names.where(is_single_word)).infer_objects(copy=False)
-
-        return result.fillna("")
-
-    @staticmethod
-    def preprocess_tracking_df(
-        tracking_df: pd.DataFrame,
-        overrides_df: pd.DataFrame
-    ) -> pd.DataFrame:
-        """
-        Preprocesses tracking dataframe. Creates new columns override_name and sci_name_clean and
-        cleans both, adds is_undescribed column, and fills in parent_egt_id and parent_sci_name
-        where it's needed.
-
-        Args:
-            tracking_df: Dataframe with tracked taxa. Should follow the TrackingSchemaClean model.
-            overrides_df: Dataframe with name overrides. Should follow the OverridesSchema model.
-        
-        Returns:
-            A copy of the tracking dataframe that has been preprocessed.
-        """
-        tracking_df = tracking_df.copy()
-
-        # Insert override names
-        tracking_df["override_name"] = (
-            tracking_df["est_id"]
-            .map(overrides_df.set_index("est_id")["inat_name"])
-        )
-        overrides_count = len(tracking_df[tracking_df["override_name"].notna()])
-        logger.debug("* Inserted %i overrides.", overrides_count)
-
-        # Preprocess names
-        tracking_df["sci_name_clean"] = (
-            tracking_df["sci_name"].apply(TaxonMappingBuilder._preprocess_name)
-        )
-        tracking_df["override_name"] = (
-            tracking_df["override_name"].apply(TaxonMappingBuilder._preprocess_name)
-        )
-
-        # Mark undescribed taxa
-        undescribed_names = TaxonMappingBuilder._get_undescribed_names(tracking_df["sci_name_clean"])
-        is_described_mask = undescribed_names == ""
-        tracking_df["is_described"] = is_described_mask
-
-        undescribed_count = len(tracking_df[~tracking_df["is_described"]])
-        logger.debug("* Identified %i undescribed taxon names.", undescribed_count)
-
-        (
-            tracking_df["parent_egt_id"], 
-            tracking_df["parent_sci_name"]
-        ) = TaxonMappingBuilder._fill_parent(tracking_df)
-
-        return tracking_df
-
-
-    @staticmethod
-    def build_override_id_map(overrides_df: pd.DataFrame) -> dict[int, int]:
-        """
-        Builds a dictionary that maps est_ids to override ids from an overrides dataframe.
-        
-        Args:
-            overrides_df: Dataframe of overrides that conforms to the OverridesSchema.
-        
-        Returns:
-            Dictionary that maps each est_id to its corresponding taxon id override from the
-            dataframe.
-        """
         just_override_ids = overrides_df.dropna(subset=["taxon_id"])
         return dict(zip(just_override_ids["est_id"], just_override_ids["taxon_id"]))
 
@@ -434,10 +319,10 @@ class TaxonMappingBuilder:
         existing mappings if any are present.
 
         Args:
-            tracking_df: Dataframe with tracking list that conforms to the TrackingSchemaClean
-            model, including the search_name and is_described columns.
-            mapping_df: Dataframe with existing mappings which conforms to the TaxonMappingSchema
-            model.
+            tracking_df: Dataframe with tracking list that includes the search_name and 
+                is_described columns.
+            mapping_df: Dataframe with existing mappings which conforms to the MappingSchema
+                model.
         
         Returns:
             A pared down copy of the tracking dataframe with just taxon that need to be searched 
@@ -448,11 +333,10 @@ class TaxonMappingBuilder:
 
         # Create mapping dataframe, either with prior entries or from scratch
         if mapping_df is None:
-            mapping_df = TaxonMappingSchema.empty()
+            mapping_df = TrackingRelSchema.empty()
 
         logger.debug("Filtering for taxa that don't have mappings yet...")
         match_mask = tracking_df["est_id"].isin(mapping_df["est_id"])
-        # needed_cols = ["sci_name", "override_name", "search_name", "est_id", "is_described"]
         needed_cols = [
             "sci_name",
             "sci_name_clean",
@@ -472,14 +356,14 @@ class TaxonMappingBuilder:
 
     def create_new_mappings(
             self,
-            tracking_df: pd.DataFrame,
+            tracking_df: DataFrame[TrackingListSchema],
             override_map: dict
     ) -> pd.DataFrame:
         """
         Creates mappings between the taxa in tracking_df and their corresponding iNaturalist taxon.
 
         Args:
-            tracking_df: A tracking list dataframe that conforms to validation.TrackingSchemaClean.
+            tracking_df: A tracking list dataframe that conforms to validation.TrackingSchema.
             override_map: A dictionary that maps taxon est_ids to manually entered iNaturalist 
                 taxon IDs. Created with TaxonMappingBuilder.build_override_id_map.
         
@@ -521,3 +405,85 @@ class TaxonMappingBuilder:
         mappings_df = pd.DataFrame(new_mappings)
         return mappings_df
     
+
+    def build(
+            self,
+            tracking_df: pd.DataFrame,
+            overrides_df: pd.DataFrame,
+            old_mappings_df: pd.DataFrame
+    ) -> DataFrame[TrackingRelSchema] | None:
+        """
+        Runs the taxon mapping builder from start to finish. Validates the tracking, overrides, and
+        old mappings dataframes, preprocesses the tracking list, filters out previously mapped taxa,
+        creates the new mappings, and returns the result. Populates self.tracking_taxa with the
+        preprocessed tracking dataframe used for the search.
+
+        Returns:
+            A dataframe of validated mappings.
+        """
+        # Make sure tracking dataframe is populated
+        if tracking_df is None or len(tracking_df) == 0:
+            raise ValueError("Tracking list is empty!")
+        if overrides_df is None:
+            raise ValueError("Overrides dataframe cannot be None.")
+        
+        # Validate schemas
+        try:
+            clean_tracking_df = TrackingListSchema.from_raw(tracking_df)
+            clean_overrides_df = OverridesSchema.from_raw(
+                overrides_df,
+                self.config.override_est_id_field,
+                self.config.override_inat_name_field,
+                self.config.override_taxon_id_field
+            )
+            clean_old_mappings_df = (
+                MappingsSchema.validate(old_mappings_df) if old_mappings_df is not None
+                else None
+            )
+        except pa.errors.SchemaError as ex:
+            report_schema_error(ex)
+
+        # Preprocess tracking list
+        preprocessed_tracking_df = TrackingListSchema.run_all_preprocessing(clean_tracking_df, clean_overrides_df)
+
+        overrides_count = len(
+            preprocessed_tracking_df[preprocessed_tracking_df["override_name"].notna()]
+        )
+        undescribed_count = len(
+            preprocessed_tracking_df[~preprocessed_tracking_df["is_described"]]
+        )
+
+        logger.debug("* Inserted %i overrides.", overrides_count)
+        logger.debug("* Identified %i undescribed taxon names.", undescribed_count)
+
+        # Filter tracking list
+        to_match = self.get_to_match(preprocessed_tracking_df, clean_old_mappings_df)
+        override_id_map = schemas.build_override_id_map(clean_overrides_df)
+
+        if len(to_match) == 0:
+            logger.warning("All taxa on tracking list are already present in mappings.")
+            return None
+
+        logger.debug(
+            "Found %i tracking list entries not present in existing mappings.",
+            len(to_match)
+        )
+        logger.info("Beginning taxon queries...")
+
+        # Generate new mappings
+        result = self.create_new_mappings(to_match, override_id_map)
+        # Only populate tracking_df if search succeeded
+        self.tracking_df = preprocessed_tracking_df
+
+        # No new taxa.
+        if len(result) == 0:
+            logger.info("No new mappings found.")
+            return None
+
+        # Validate mappings
+        try:
+            self.new_mappings_df = schemas.TrackingRelSchema.validate(result)
+        except pa.errors.SchemaError as ex:
+            report_schema_error(ex)
+    
+        return self.new_mappings_df
